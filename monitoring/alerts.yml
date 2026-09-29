@@ -1,0 +1,59 @@
+groups:
+  - name: meta-api
+    rules:
+      - alert: MetaApiHighErrorRate
+        expr: |
+          sum(rate(meta_api_requests_total{outcome!="success"}[5m]))
+            / clamp_min(sum(rate(meta_api_requests_total[5m])), 1e-9) > 0.05
+        for: 2m
+        labels: {severity: warning}
+        annotations:
+          summary: "Meta API failure rate above 5% ({{ $value | humanizePercentage }})"
+
+      - alert: MetaApiRateLimitNear
+        expr: max(meta_api_rate_limit_usage_percent) > 75
+        for: 1m
+        labels: {severity: warning}
+        annotations:
+          summary: "Meta rate-limit usage at {{ $value }}% ({{ $labels.header }} {{ $labels.usage_type }}/{{ $labels.metric }})"
+
+      - alert: MetaApiThrottled
+        expr: sum(rate(meta_api_requests_total{outcome="throttled"}[5m])) > 0
+        for: 2m
+        labels: {severity: warning}
+        annotations:
+          summary: "Meta is throttling requests even after retries"
+
+      - alert: MetaApiCircuitOpen
+        expr: meta_api_circuit_state == 2
+        for: 30s
+        labels: {severity: critical}
+        annotations:
+          summary: "Meta API circuit breaker is OPEN - calls are failing fast"
+
+      - alert: MetaApiHighLatency
+        expr: |
+          histogram_quantile(0.95, sum by (le) (rate(meta_api_request_duration_seconds_bucket[5m]))) > 2
+        for: 5m
+        labels: {severity: warning}
+        annotations:
+          summary: "Meta API p95 latency {{ $value | humanizeDuration }}"
+
+      - alert: MetaAccessTokenInvalid
+        expr: sum(increase(meta_api_errors_total{code="190"}[5m])) > 0
+        labels: {severity: critical}
+        annotations:
+          summary: "Meta returned OAuth error 190 - access token expired or revoked"
+
+      - alert: MetaWebhookBadSignatures
+        expr: sum(increase(meta_webhook_events_total{signature="invalid"}[5m])) > 0
+        labels: {severity: warning}
+        annotations:
+          summary: "Webhook deliveries with invalid X-Hub-Signature-256"
+
+      - alert: MetaApiTesterDown
+        expr: up{job="meta-api-tester"} == 0
+        for: 1m
+        labels: {severity: critical}
+        annotations:
+          summary: "meta-api-tester is not being scraped"
