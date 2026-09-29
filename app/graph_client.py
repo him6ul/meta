@@ -17,6 +17,7 @@ from typing import Any
 import httpx
 from opentelemetry import trace
 
+from app.audit import AuditLog, digest, sanitize
 from app.config import Settings
 from app.metrics import (
     META_ATTEMPTS,
@@ -90,7 +91,8 @@ class CircuitOpenError(Exception):
 class CircuitBreaker:
     CLOSED, HALF_OPEN, OPEN = 0, 1, 2
 
-    def __init__(self, failure_threshold: int, reset_seconds: float):
+    def __init__(self, failure_threshold: int, reset_seconds: float, on_change=None):
+        self.on_change = on_change
         self.failure_threshold = failure_threshold
         self.reset_seconds = reset_seconds
         self.failures = 0
@@ -101,6 +103,8 @@ class CircuitBreaker:
     def _set(self, state: int) -> None:
         if state != self.state:
             log.warning("circuit state change", extra={"from_state": self.state, "to_state": state})
+            if self.on_change:
+                self.on_change(self.state, state, self.failures)
         self.state = state
         META_CIRCUIT_STATE.set(state)
 
@@ -162,10 +166,13 @@ def record_rate_limit_headers(headers: httpx.Headers) -> dict[str, Any]:
 
 
 class MetaGraphClient:
-    def __init__(self, settings: Settings, transport: httpx.AsyncBaseTransport | None = None):
+    def __init__(self, settings: Settings, transport: httpx.AsyncBaseTransport | None = None,
+                 audit: AuditLog | None = None):
         self.settings = settings
+        self.audit = audit
         self.breaker = CircuitBreaker(settings.meta_circuit_failure_threshold,
-                                      settings.meta_circuit_reset_seconds)
+                                      settings.meta_circuit_reset_seconds,
+                                      on_change=self._audit_circuit)
         self._http = httpx.AsyncClient(
             base_url=settings.graph_url,
             timeout=settings.meta_timeout_seconds,
@@ -189,6 +196,35 @@ class MetaGraphClient:
             params["appsecret_proof"] = self.appsecret_proof(token)
         return params
 
+    _STATE_NAMES = {CircuitBreaker.CLOSED: "closed", CircuitBreaker.HALF_OPEN: "half_open",
+                    CircuitBreaker.OPEN: "open"}
+
+    def _audit_circuit(self, old: int, new: int, failures: int) -> None:
+        if self.audit:
+            self.audit.record("meta.circuit.state_changed", actor="system", resource="meta-graph-api",
+                              from_state=self._STATE_NAMES[old], to_state=self._STATE_NAMES[new],
+                              consecutive_failures=failures)
+
+    def _audit_call(self, method: str, path: str, params: dict | None, json_body: dict | None,
+                    outcome: str, attempts: int, status: str, duration_ms: float,
+                    err: MetaAPIError | None = None, result: dict | None = None,
+                    error: str | None = None) -> None:
+        if not self.audit:
+            return
+        object_ids = None
+        if result:
+            ids = [result.get("id")] + [m.get("id") for m in result.get("messages", []) if isinstance(m, dict)]
+            object_ids = [i for i in ids if i] or None
+        self.audit.record(
+            f"meta.api.{method.lower()}", outcome=outcome, resource=path,
+            endpoint=normalize_endpoint(path), http_status=status, attempts=attempts,
+            duration_ms=round(duration_ms, 1), params=sanitize(params) or None,
+            body=digest(json.dumps(json_body, sort_keys=True)) if json_body else None,
+            result_object_ids=object_ids, error=error,
+            meta_error={"code": err.code, "subcode": err.subcode, "type": err.type,
+                        "fbtrace_id": err.fbtrace_id, "message": err.message} if err else None,
+        )
+
     def _backoff(self, attempt: int, err: MetaAPIError | None) -> float:
         delay = min(self.settings.meta_backoff_max_seconds,
                     self.settings.meta_backoff_base_seconds * (2 ** attempt))
@@ -201,6 +237,11 @@ class MetaGraphClient:
         endpoint = normalize_endpoint(path)
         query = {**(params or {}), **self._auth_params(token)}
         last_status = "error"
+        call_start = time.perf_counter()
+
+        def audit(outcome: str, attempts: int, status: str, **kw):
+            self._audit_call(method, path, params, json_body, outcome, attempts, status,
+                             (time.perf_counter() - call_start) * 1000, **kw)
 
         with tracer.start_as_current_span(f"meta {method} {endpoint}") as span:
             span.set_attribute("meta.endpoint", endpoint)
@@ -209,6 +250,7 @@ class MetaGraphClient:
             except CircuitOpenError:
                 META_REQUESTS.labels(endpoint, method, "none", "circuit_open").inc()
                 span.set_attribute("meta.outcome", "circuit_open")
+                audit("circuit_open", 0, "none")
                 raise
 
             for attempt in range(self.settings.meta_max_retries + 1):
@@ -231,6 +273,7 @@ class MetaGraphClient:
                     self.breaker.record_failure()
                     META_REQUESTS.labels(endpoint, method, reason, "failure").inc()
                     span.set_status(trace.StatusCode.ERROR, reason)
+                    audit("failure", attempt + 1, reason, error=repr(exc))
                     raise
 
                 elapsed = time.perf_counter() - start
@@ -248,7 +291,9 @@ class MetaGraphClient:
                     log.info("meta call ok", extra={"endpoint": endpoint, "method": method,
                                                     "status": resp.status_code, "attempt": attempt,
                                                     "duration_ms": round(elapsed * 1000, 1)})
-                    return resp.json() if resp.content else {}
+                    result = resp.json() if resp.content else {}
+                    audit("success", attempt + 1, status, result=result)
+                    return result
 
                 err = MetaAPIError.from_response(resp)
                 META_ERRORS.labels(endpoint, str(err.code), str(err.subcode), str(err.type)).inc()
@@ -273,6 +318,7 @@ class MetaGraphClient:
                 outcome = "throttled" if err.is_throttle else "failure"
                 META_REQUESTS.labels(endpoint, method, status, outcome).inc()
                 span.set_status(trace.StatusCode.ERROR, str(err))
+                audit(outcome, attempt + 1, status, err=err)
                 raise err
 
         raise RuntimeError(f"unreachable (last_status={last_status})")

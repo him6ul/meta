@@ -57,3 +57,17 @@ groups:
         labels: {severity: critical}
         annotations:
           summary: "meta-api-tester is not being scraped"
+
+  - name: audit
+    rules:
+      - alert: AuditLogWriteFailing
+        expr: sum(increase(audit_write_failures_total[5m])) > 0
+        labels: {severity: critical}
+        annotations:
+          summary: "Audit records are failing to persist - actions are not being recorded"
+
+      - alert: UnauthenticatedApiAccess
+        expr: sum(increase(audit_events_total{action="http.request", outcome="denied"}[5m])) > 10
+        labels: {severity: warning}
+        annotations:
+          summary: "{{ $value }} denied API requests in 5m (bad or missing X-API-Key)"

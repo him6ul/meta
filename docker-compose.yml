@@ -17,6 +17,10 @@ services:
       META_PAGE_ID: ${META_PAGE_ID:-2000001}
       INSTAGRAM_ACCOUNT_ID: ${INSTAGRAM_ACCOUNT_ID:-17841400000}
       OTEL_EXPORTER_OTLP_ENDPOINT: http://jaeger:4318
+      AUDIT_LOG_PATH: /data/audit.jsonl
+      APP_API_KEYS: ${APP_API_KEYS:-}
+    volumes:
+      - audit-data:/data
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request;urllib.request.urlopen('http://localhost:8000/health')"]
       interval: 10s
@@ -38,6 +42,22 @@ services:
     command: ["python", "scripts/loadgen.py", "--base", "http://app:8000", "--rps", "5", "--duration", "3600"]
     depends_on: [app]
 
+  alertmanager:
+    image: prom/alertmanager:v0.28.1
+    ports: ["9093:9093"]
+    environment:
+      # Defaults to the mock's fake Slack endpoint; set a real incoming-webhook URL in .env.
+      SLACK_WEBHOOK_URL: ${SLACK_WEBHOOK_URL:-http://mock-meta:8081/_mock/slack}
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - >-
+        printf '%s' "$$SLACK_WEBHOOK_URL" > /tmp/slack_webhook_url &&
+        exec /bin/alertmanager --config.file=/etc/alertmanager/alertmanager.yml
+        --storage.path=/alertmanager --web.external-url=http://localhost:9093
+    volumes:
+      - ./monitoring/alertmanager:/etc/alertmanager:ro
+    depends_on: [mock-meta]
+
   prometheus:
     image: prom/prometheus:v3.5.0
     ports: ["9090:9090"]
@@ -45,6 +65,7 @@ services:
     volumes:
       - ./monitoring/prometheus.yml:/etc/prometheus/prometheus.yml:ro
       - ./monitoring/alerts.yml:/etc/prometheus/alerts.yml:ro
+    depends_on: [alertmanager]
 
   grafana:
     image: grafana/grafana:12.1.0
@@ -63,3 +84,6 @@ services:
     ports: ["16686:16686", "4318:4318"]
     environment:
       COLLECTOR_OTLP_ENABLED: "true"
+
+volumes:
+  audit-data:

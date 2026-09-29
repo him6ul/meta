@@ -6,7 +6,7 @@ RUN pip install --no-cache-dir -r requirements.txt
 COPY app ./app
 COPY mock_meta ./mock_meta
 COPY scripts ./scripts
-RUN useradd -r -u 10001 appuser
+RUN useradd -r -u 10001 appuser && mkdir -p /data && chown appuser /data
 USER appuser
 EXPOSE 8000
 CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]

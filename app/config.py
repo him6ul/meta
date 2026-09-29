@@ -25,9 +25,20 @@ class Settings(BaseSettings):
     meta_circuit_failure_threshold: int = 5
     meta_circuit_reset_seconds: float = 30.0
 
+    # Audit trail. APP_API_KEYS="alice:key1,ci-bot:key2" enables API-key auth on /api/*; the key's
+    # name becomes the audited actor. Unset = open access, actor taken from X-Actor (unverified).
+    audit_log_path: str = "data/audit.jsonl"
+    app_api_keys: str = ""
+
     log_level: str = "INFO"
     otel_exporter_otlp_endpoint: str = ""
     otel_service_name: str = "meta-api-tester"
+
+    @property
+    def api_keys(self) -> dict[str, str]:
+        """key -> actor name"""
+        pairs = (p.split(":", 1) for p in self.app_api_keys.split(",") if ":" in p)
+        return {key.strip(): name.strip() for name, key in pairs}
 
     @property
     def graph_url(self) -> str:

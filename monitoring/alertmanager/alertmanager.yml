@@ -1,0 +1,64 @@
+# The Slack webhook URL is written to /tmp/slack_webhook_url at container start from $SLACK_WEBHOOK_URL
+# (see docker-compose.yml), so the secret never lives in this file.
+# Every receiver also posts to the app's /webhooks/alertmanager so each notification is audited.
+global:
+  resolve_timeout: 5m
+
+templates:
+  - /etc/alertmanager/templates/*.tmpl
+
+route:
+  receiver: slack
+  group_by: [alertname]
+  group_wait: 10s
+  group_interval: 1m
+  repeat_interval: 4h
+  routes:
+    - matchers: [severity="critical"]
+      receiver: slack-critical
+      group_wait: 5s
+      repeat_interval: 30m
+
+receivers:
+  - name: slack
+    slack_configs:
+      - api_url_file: /tmp/slack_webhook_url
+        send_resolved: true
+        color: '{{ template "slack.meta.color" . }}'
+        title: '{{ template "slack.meta.title" . }}'
+        text: '{{ template "slack.meta.text" . }}'
+        actions:
+          - type: button
+            text: Grafana dashboard
+            url: '{{ template "slack.meta.grafana" . }}'
+          - type: button
+            text: Silence
+            url: '{{ template "slack.meta.silence" . }}'
+    webhook_configs:
+      - url: http://app:8000/webhooks/alertmanager
+        send_resolved: true
+  - name: slack-critical
+    slack_configs:
+      - api_url_file: /tmp/slack_webhook_url
+        send_resolved: true
+        color: '{{ template "slack.meta.color" . }}'
+        title: ':rotating_light: {{ template "slack.meta.title" . }}'
+        text: '{{ template "slack.meta.text" . }}'
+        actions:
+          - type: button
+            text: Grafana dashboard
+            url: '{{ template "slack.meta.grafana" . }}'
+          - type: button
+            text: Silence
+            url: '{{ template "slack.meta.silence" . }}'
+    webhook_configs:
+      - url: http://app:8000/webhooks/alertmanager
+        send_resolved: true
+
+inhibit_rules:
+  # When the circuit is open, error-rate/latency/throttle alerts are symptoms of the same outage.
+  - source_matchers: [alertname="MetaApiCircuitOpen"]
+    target_matchers: [alertname=~"MetaApiHighErrorRate|MetaApiHighLatency|MetaApiThrottled"]
+  # If the app itself is down, nothing else from it is meaningful.
+  - source_matchers: [alertname="MetaApiTesterDown"]
+    target_matchers: [severity=~"warning|critical", alertname!="MetaApiTesterDown"]

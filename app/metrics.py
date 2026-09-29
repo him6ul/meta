@@ -63,6 +63,14 @@ WEBHOOK_VERIFICATIONS = Counter(
     ["result"],
 )
 
+# --- Audit trail ---
+AUDIT_EVENTS = Counter("audit_events_total", "Audit records written", ["action", "outcome"])
+AUDIT_WRITE_FAILURES = Counter("audit_write_failures_total", "Audit records that could not be persisted")
+
+# --- Alert notifications ---
+ALERT_NOTIFICATIONS = Counter("alert_notifications_total", "Alertmanager notifications received",
+                              ["alertname", "status", "severity"])
+
 # --- The app's own HTTP surface ---
 HTTP_REQUESTS = Counter(
     "app_http_requests_total", "Inbound HTTP requests", ["route", "method", "status"]

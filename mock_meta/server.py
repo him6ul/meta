@@ -14,10 +14,12 @@ import os
 import random
 import time
 import uuid
+from collections import deque
+from datetime import datetime, timezone
 
 import httpx
 from fastapi import FastAPI, Request
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, PlainTextResponse
 from pydantic import BaseModel
 
 app = FastAPI(title="Mock Meta Graph API")
@@ -35,6 +37,7 @@ class MockConfig(BaseModel):
 CONFIG = MockConfig()
 APP_SECRET = os.getenv("META_APP_SECRET", "")
 WEBHOOK_TARGET = os.getenv("MOCK_WEBHOOK_TARGET", "http://app:8000/webhooks/meta")
+SLACK_MESSAGES: deque = deque(maxlen=100)
 _window_start = time.monotonic()
 _window_calls = 0
 
@@ -107,15 +110,39 @@ async def get_config():
     return CONFIG
 
 
+def audit(action: str, request: Request, **details) -> None:
+    """Chaos changes alter what the system under test sees, so they are audited (JSON line on stdout)."""
+    print(json.dumps({"audit": True, "ts": datetime.now(timezone.utc).isoformat(), "service": "mock-meta",
+                      "action": action, "actor": request.headers.get("x-actor", "anonymous"),
+                      "actor_ip": request.client.host if request.client else None, **details}), flush=True)
+
+
 @app.post("/_mock/config")
-async def set_config(update: dict):
+async def set_config(update: dict, request: Request):
     global CONFIG
+    before = CONFIG.model_dump()
     CONFIG = CONFIG.model_copy(update=update)
+    audit("mock.config.changed", request, before=before, after=CONFIG.model_dump(), requested=update)
     return CONFIG
 
 
+@app.post("/_mock/slack")
+async def fake_slack(request: Request):
+    """Stands in for a Slack incoming webhook so the alert path can be tested without Slack."""
+    msg = await request.json()
+    SLACK_MESSAGES.appendleft({"received_at": datetime.now(timezone.utc).isoformat(), "message": msg})
+    print(json.dumps({"fake_slack": True, "attachments": [a.get("title") for a in msg.get("attachments", [])]}),
+          flush=True)
+    return PlainTextResponse("ok")
+
+
+@app.get("/_mock/slack")
+async def fake_slack_messages():
+    return list(SLACK_MESSAGES)
+
+
 @app.post("/_mock/send-webhook")
-async def send_webhook(valid_signature: bool = True):
+async def send_webhook(request: Request, valid_signature: bool = True):
     payload = {"object": "whatsapp_business_account", "entry": [{
         "id": "123456789", "changes": [{"field": "messages", "value": {
             "messaging_product": "whatsapp",
@@ -131,6 +158,8 @@ async def send_webhook(valid_signature: bool = True):
     async with httpx.AsyncClient(timeout=5) as c:
         r = await c.post(WEBHOOK_TARGET, content=body,
                          headers={"content-type": "application/json", "x-hub-signature-256": sig})
+    audit("mock.webhook.sent", request, target=WEBHOOK_TARGET, valid_signature=valid_signature,
+          response_status=r.status_code)
     return {"target": WEBHOOK_TARGET, "status": r.status_code, "response": r.text}
 
 

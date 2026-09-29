@@ -1,3 +1,4 @@
+import hmac
 import logging
 import time
 from contextlib import asynccontextmanager
@@ -8,6 +9,7 @@ from fastapi.responses import JSONResponse, Response
 from prometheus_client import CONTENT_TYPE_LATEST, generate_latest
 
 from app import routes, webhooks
+from app.audit import AuditLog, digest, new_request_id, request_context, sanitize
 from app.config import get_settings
 from app.graph_client import CircuitBreaker, CircuitOpenError, MetaAPIError, MetaGraphClient
 from app.metrics import HTTP_LATENCY, HTTP_REQUESTS
@@ -15,39 +17,81 @@ from app.observability import setup_logging, setup_tracing
 
 log = logging.getLogger("app")
 
+# Probe/scrape traffic isn't a user action; everything else is audited.
+UNAUDITED_PATHS = {"/metrics", "/health", "/ready"}
+
+
+def resolve_actor(request: Request, api_keys: dict[str, str]) -> tuple[str | None, bool]:
+    """Return (actor, authenticated). With API keys configured, /api/* requires a valid X-API-Key."""
+    if api_keys:
+        presented = request.headers.get("x-api-key", "")
+        for key, name in api_keys.items():
+            if hmac.compare_digest(presented, key):
+                return name, True
+        if request.url.path.startswith("/api"):
+            return None, False
+    claimed = request.headers.get("x-actor")
+    return (f"unverified:{claimed}" if claimed else "anonymous"), True
+
 
 def create_app(transport: httpx.AsyncBaseTransport | None = None) -> FastAPI:
     settings = get_settings()
     setup_logging(settings)
+    audit = AuditLog(settings.audit_log_path)
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
-        app.state.meta = MetaGraphClient(settings, transport=transport)
-        log.info("started", extra={"graph_url": settings.graph_url,
-                                   "token_configured": bool(settings.meta_access_token),
-                                   "app_secret_configured": bool(settings.meta_app_secret)})
+        app.state.meta = MetaGraphClient(settings, transport=transport, audit=audit)
+        audit.record("app.started", actor="system", resource="meta-api-tester",
+                     graph_url=settings.graph_url, api_key_auth=bool(settings.api_keys),
+                     token_configured=bool(settings.meta_access_token),
+                     app_secret_configured=bool(settings.meta_app_secret))
+        log.info("started", extra={"graph_url": settings.graph_url})
         yield
+        audit.record("app.stopped", actor="system", resource="meta-api-tester")
         await app.state.meta.aclose()
 
-    app = FastAPI(title="Meta API Tester", version="1.0.0", lifespan=lifespan,
+    app = FastAPI(title="Meta API Tester", version="1.1.0", lifespan=lifespan,
                   description="Test harness for Meta Graph API (WhatsApp, Pages, Instagram) with "
-                              "Prometheus metrics, OpenTelemetry traces and structured logs.")
+                              "Prometheus metrics, OpenTelemetry traces, structured logs and a "
+                              "hash-chained audit trail.")
+    app.state.audit = audit
     setup_tracing(settings, app)
 
     @app.middleware("http")
-    async def metrics_middleware(request: Request, call_next):
+    async def audit_and_metrics(request: Request, call_next):
         start = time.perf_counter()
+        path = request.url.path
+        audited = path not in UNAUDITED_PATHS
+        request_id = request.headers.get("x-request-id") or new_request_id()
+        actor, authenticated = resolve_actor(request, settings.api_keys)
+        request_context.set({"request_id": request_id, "actor": actor or "unauthenticated",
+                             "ip": request.client.host if request.client else None,
+                             "user_agent": request.headers.get("user-agent")})
+        body = await request.body() if audited and request.method in ("POST", "PUT", "PATCH", "DELETE") else b""
         status = 500
         try:
-            response = await call_next(request)
-            status = response.status_code
+            if not authenticated:
+                status = 401
+                response = JSONResponse(status_code=401, content={"error": "missing or invalid X-API-Key"})
+            else:
+                response = await call_next(request)
+                status = response.status_code
+            response.headers["x-request-id"] = request_id
             return response
         finally:
+            elapsed = time.perf_counter() - start
             route = request.scope.get("route")
             label = route.path if route is not None else "unmatched"
-            if label != "/metrics":
+            if path != "/metrics":
                 HTTP_REQUESTS.labels(label, request.method, str(status)).inc()
-                HTTP_LATENCY.labels(label, request.method).observe(time.perf_counter() - start)
+                HTTP_LATENCY.labels(label, request.method).observe(elapsed)
+            if audited:
+                outcome = ("denied" if status in (401, 403) else
+                           "success" if status < 400 else "failure")
+                audit.record("http.request", outcome=outcome, resource=path, method=request.method,
+                             route=label, http_status=status, duration_ms=round(elapsed * 1000, 1),
+                             query=sanitize(dict(request.query_params)) or None, body=digest(body))
 
     @app.exception_handler(MetaAPIError)
     async def meta_error(_: Request, exc: MetaAPIError):
@@ -73,6 +117,7 @@ def create_app(transport: httpx.AsyncBaseTransport | None = None) -> FastAPI:
         checks = {
             "access_token_configured": bool(settings.meta_access_token),
             "circuit_closed": meta.breaker.state != CircuitBreaker.OPEN,
+            "audit_log_writable": audit.writable(),
         }
         ok = all(checks.values())
         return JSONResponse(status_code=200 if ok else 503, content={"ready": ok, "checks": checks})

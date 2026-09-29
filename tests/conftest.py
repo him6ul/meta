@@ -1,4 +1,7 @@
 import os
+import tempfile
+
+import pytest
 
 os.environ.update({
     "META_GRAPH_BASE_URL": "https://graph.test",
@@ -13,4 +16,15 @@ os.environ.update({
     "META_MAX_RETRIES": "2",
     "META_CIRCUIT_FAILURE_THRESHOLD": "3",
     "OTEL_EXPORTER_OTLP_ENDPOINT": "",
+    "AUDIT_LOG_PATH": os.path.join(tempfile.mkdtemp(), "audit.jsonl"),
 })
+
+
+@pytest.fixture(autouse=True)
+def fresh_audit_log(tmp_path, monkeypatch):
+    """Each test gets its own audit file so chain assertions are independent."""
+    from app.config import get_settings
+    monkeypatch.setenv("AUDIT_LOG_PATH", str(tmp_path / "audit.jsonl"))
+    get_settings.cache_clear()
+    yield tmp_path / "audit.jsonl"
+    get_settings.cache_clear()

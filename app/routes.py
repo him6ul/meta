@@ -107,3 +107,19 @@ async def instagram_media(request: Request, limit: int = 10):
     ig_id = require(get_settings().instagram_account_id, "INSTAGRAM_ACCOUNT_ID")
     return await client(request).get(f"/{ig_id}/media",
                                      params={"limit": limit, "fields": "id,caption,media_type,timestamp"})
+
+
+# ---------- Audit trail ----------
+@router.get("/audit", tags=["audit"])
+async def audit_query(request: Request, limit: int = 100, action: str | None = None,
+                      actor: str | None = None, request_id: str | None = None,
+                      outcome: str | None = None):
+    """Newest-first audit records. `action` matches exactly or as a prefix (e.g. `meta.api`)."""
+    return request.app.state.audit.query(limit=min(limit, 1000), action=action, actor=actor,
+                                         request_id=request_id, outcome=outcome)
+
+
+@router.get("/audit/verify", tags=["audit"])
+async def audit_verify(request: Request):
+    """Recompute the hash chain; `ok: false` means records were altered, removed or reordered."""
+    return request.app.state.audit.verify()

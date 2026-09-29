@@ -1,0 +1,16 @@
+{{ define "slack.meta.color" }}{{ if eq .Status "firing" }}{{ if eq .CommonLabels.severity "critical" }}danger{{ else }}warning{{ end }}{{ else }}good{{ end }}{{ end }}
+
+{{ define "slack.meta.title" }}[{{ .Status | toUpper }}{{ if eq .Status "firing" }}:{{ .Alerts.Firing | len }}{{ end }}] {{ .CommonLabels.alertname }}{{ end }}
+
+{{ define "slack.meta.text" }}
+{{- range .Alerts }}
+*{{ .Annotations.summary }}*
+• severity: `{{ .Labels.severity }}`  • started: {{ .StartsAt.Format "2006-01-02 15:04:05 MST" }}{{ if eq .Status "resolved" }}  • resolved: {{ .EndsAt.Format "15:04:05 MST" }}{{ end }}
+{{- range .Labels.SortedPairs }}{{ if and (ne .Name "alertname") (ne .Name "severity") }}
+• {{ .Name }}: `{{ .Value }}`{{ end }}{{ end }}
+{{ end }}
+{{- end }}
+
+{{ define "slack.meta.grafana" }}{{ or (index .CommonAnnotations "dashboard") "http://localhost:3000/d/meta-api" }}{{ end }}
+
+{{ define "slack.meta.silence" }}{{ .ExternalURL }}/#/silences/new?filter=%7Balertname%3D%22{{ .CommonLabels.alertname }}%22%7D{{ end }}
