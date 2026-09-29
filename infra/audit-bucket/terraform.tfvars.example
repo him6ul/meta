@@ -1,0 +1,7 @@
+bucket_name            = "acme-meta-audit-archive"
+region                 = "us-east-1"
+lock_mode              = "GOVERNANCE" # switch to COMPLIANCE once validated (irreversible per object)
+retention_days         = 365
+shipper_principal_arns = ["arn:aws:iam::123456789012:role/meta-audit-shipper"]
+# break_glass_principal_arns = ["arn:aws:iam::123456789012:role/security-break-glass"]
+# admin_principal_arns       = ["arn:aws:iam::123456789012:role/terraform-deployer"]

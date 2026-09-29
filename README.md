@@ -14,6 +14,7 @@ with fault injection, so the whole stack works before you have credentials.
                ├─► OTLP traces ──► Jaeger :16686
                ├─► JSON logs (stdout, trace_id-correlated, tokens redacted)
                └─► audit trail (append-only, hash-chained JSONL, /api/audit)
+                        └─(read-only)─► audit-shipper ──► S3 Object Lock (WORM, LocalStack locally)
 ```
 
 ## Quick start (mock Meta, no credentials needed)
@@ -29,6 +30,7 @@ docker compose up -d --build
 | Prometheus + alerts | http://localhost:9090/alerts |
 | Alertmanager (silences) | http://localhost:9093 |
 | Fake Slack inbox (when no real webhook set) | http://localhost:8081/_mock/slack |
+| LocalStack S3 (Object Lock archive) | http://localhost:4566 (`make audit-archive-ls`) |
 | Jaeger traces (service `meta-api-tester`) | http://localhost:16686 |
 | Mock Meta control | http://localhost:8081/docs |
 
@@ -153,13 +155,81 @@ takes the instance out of rotation instead of letting it act without a record.
 **Identity:** without `APP_API_KEYS`, actors are self-declared (`X-Actor`) and labelled `unverified:`.
 Set API keys (or put an authenticating proxy in front) when the actor must be trustworthy.
 
-For production, ship the file or the `audit` log stream to WORM/immutable storage (e.g. S3 Object Lock)
+Records are also archived off-host to S3 Object Lock, below.
+
+## Audit archive: S3 Object Lock (`app/audit_shipper.py`)
+
+A separate **audit-shipper** container tails the audit log (mounted **read-only**) and uploads it as
+immutable segments. It holds the only S3 credentials, and they are write-only: it can add segments but
+can't list, delete or change retention. Compromising the app therefore doesn't expose the archive.
+
+```
+s3://<bucket>/audit/meta-api-tester/2026/09/29/000000000001-000000000036.jsonl
+  ObjectLockMode=COMPLIANCE  RetainUntilDate=+N days  SSE-KMS  x-amz-checksum-sha256
+  metadata: first-seq, last-seq, first-prev-hash, last-hash, sha256, source-host
+```
+
+- Segments flush every `AUDIT_SHIP_FLUSH_SECONDS` (10s) or 500 records. The checkpoint (byte offset + last
+  seq/hash) advances only after S3 confirms the write, so restarts resume with no loss and no duplicates.
+- **Nothing forged is archived.** Every record must chain onto the last archived hash. A break halts
+  shipping.
+- **Rewrites are detected.** Every 60s, and at startup, the shipper checks that the local file still
+  contains the exact record it last archived. If someone truncates the file or rewrites history with a
+  fresh, internally valid chain (which *passes* the local `/api/audit/verify`), shipping halts with
+  `source_diverged` and 🚨 `AuditArchiveDiverged` goes to Slack. The shipper stays halted until a human
+  investigates. `make audit-verify-s3` then lists every local seq that differs from the archive.
+- The shipper audits its own actions (`audit.segment.shipped` with key/version/hash, `ship_failed`,
+  `shipping.halted`) as JSON lines on stdout.
+
+**Verifier** (`make audit-verify-s3`, or `python -m app.audit_shipper verify [--compare-local FILE]`)
+reads **every object version**, checks each segment's SHA-256, confirms each has an unexpired lock, rebuilds
+the chain from seq 1, and reports gaps, conflicting duplicates and local mismatches. It also reads
+through **delete markers**: a plain DELETE on a locked bucket is allowed but only hides the version. The
+locked record is still verified and the marker is reported as a delete attempt. Exit code 1 if anything is
+off.
+
+Alerts: `AuditArchiveDiverged` (critical), `AuditShipperDown` (critical), `AuditArchiveLagging` (>5 min
+unarchived), `AuditArchiveUploadFailures`. The Grafana dashboard shows written vs archived seq, lag, time
+since last upload, and chain integrity.
+
+**Local:** LocalStack enforces Object Lock (COMPLIANCE, 1 day), so version deletes and retention changes
+are refused. Its archive is **ephemeral**, lost when the container is recreated. Use
+`make audit-archive-reset-local` to wipe it together with the shipper checkpoint.
+
+### Production bucket (`infra/audit-bucket`, Terraform)
+
+```bash
+cd infra/audit-bucket
+cp terraform.tfvars.example terraform.tfvars   # bucket name, shipper role, admins
+terraform init && terraform plan
+```
+
+It creates:
+- the bucket with Object Lock, versioning and default retention
+- a dedicated KMS key with rotation, and a public access block
+- a bucket policy that denies non-TLS access, denies writes under any other KMS key, denies
+  `s3:BypassGovernanceRetention` (except optional break-glass principals), and denies
+  lock/versioning/lifecycle/policy changes (except `admin_principal_arns`)
+- a Glacier IR transition after 90 days
+- least-privilege **shipper** (write-only) and **verifier** (read-only) IAM policies
+- a **CloudTrail data-event trail** on the bucket, so every read, write and delete attempt against the
+  archive is itself recorded
+
+Then set the `shipper_env` output values in `.env` (with `AUDIT_S3_ENDPOINT_URL=` empty) and give the
+shipper the IAM role.
+
+> ⚠️ `lock_mode` defaults to **GOVERNANCE** so you can validate first. **COMPLIANCE** can't be shortened
+> or removed by anyone, including the AWS root account, until retention expires. You'll pay to store every
+> object for the full period. Switch deliberately.
+
+Remaining trust boundary: records written locally but not yet shipped (≤10s by default) exist only on the
+host. For zero-window capture, have the app write synchronously to S3 or a stream (e.g. Kinesis/Firehose).
 and periodically anchor the `head_hash` externally, since a local file can be replaced wholesale.
 
 ## Local dev
 
 ```bash
-make install && make test     # 21 tests, pytest + respx
+make install && make test     # 29 tests, pytest + respx
 make mock &                   # mock on :8081
 META_GRAPH_BASE_URL=http://localhost:8081 META_ACCESS_TOKEN=x make run
 ```

@@ -54,6 +54,12 @@ def _chain_hash(prev_hash: str, record: dict[str, Any]) -> str:
     return hashlib.sha256((prev_hash + body).encode()).hexdigest()
 
 
+def link_ok(prev_hash: str, record: dict[str, Any]) -> bool:
+    """True if `record` correctly chains onto `prev_hash` (shared by verify() and the S3 shipper)."""
+    body = {k: v for k, v in record.items() if k != "hash"}
+    return body.get("prev_hash") == prev_hash and _chain_hash(prev_hash, body) == record.get("hash")
+
+
 class AuditLog:
     def __init__(self, path: str):
         self.path = Path(path)
@@ -133,8 +139,7 @@ class AuditLog:
     def verify(self) -> dict[str, Any]:
         prev, count = GENESIS_HASH, 0
         for rec in self._iter():
-            stored = rec.pop("hash")
-            if rec.get("prev_hash") != prev or _chain_hash(prev, rec) != stored or rec["seq"] != count + 1:
+            if not link_ok(prev, rec) or rec["seq"] != count + 1:
                 return {"ok": False, "records_checked": count, "first_bad_seq": rec.get("seq")}
-            prev, count = stored, count + 1
+            prev, count = rec["hash"], count + 1
         return {"ok": True, "records_checked": count, "head_hash": prev}

@@ -1,4 +1,4 @@
-.PHONY: install test run mock up down load chaos-errors chaos-outage chaos-throttle chaos-reset webhook audit audit-verify slack
+.PHONY: install test run mock up down load chaos-errors chaos-outage chaos-throttle chaos-reset webhook audit audit-verify slack audit-verify-s3 audit-archive-ls audit-archive-reset-local
 
 install:
 	python3 -m venv .venv && .venv/bin/pip install -r requirements-dev.txt
@@ -44,3 +44,13 @@ audit-verify:
 
 slack:      ## messages received by the fake Slack endpoint
 	curl -s localhost:8081/_mock/slack | python3 -m json.tool
+
+audit-verify-s3:   ## verify the S3 Object Lock archive end-to-end and against the local log
+	docker compose exec -T audit-shipper python -m app.audit_shipper verify --compare-local /data/audit.jsonl
+
+audit-archive-ls:
+	docker compose exec -T localstack awslocal s3api list-object-versions --bucket meta-audit-local \
+	  --query '{versions: Versions[].[Key,VersionId], delete_markers: DeleteMarkers[].[Key,VersionId]}'
+
+audit-archive-reset-local:   ## LocalStack only: wipe the ephemeral archive and the shipper checkpoint
+	docker compose rm -sf localstack audit-shipper && docker volume rm -f meta_shipper-state && docker compose up -d

@@ -42,6 +42,47 @@ services:
     command: ["python", "scripts/loadgen.py", "--base", "http://app:8000", "--rps", "5", "--duration", "3600"]
     depends_on: [app]
 
+  # Local stand-in for S3 with Object Lock (enforces COMPLIANCE retention). Ephemeral: the archive is
+  # lost when this container is recreated. Point AUDIT_S3_* at a real bucket for durable storage.
+  localstack:
+    image: localstack/localstack:4.14
+    ports: ["4566:4566"]
+    environment:
+      SERVICES: s3
+      AUDIT_S3_BUCKET: ${AUDIT_S3_BUCKET:-meta-audit-local}
+    volumes:
+      - ./monitoring/localstack/init-audit-bucket.sh:/etc/localstack/init/ready.d/init-audit-bucket.sh:ro
+    healthcheck:
+      test: ["CMD-SHELL", "awslocal s3api get-object-lock-configuration --bucket $${AUDIT_S3_BUCKET} >/dev/null"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+
+  # Tails the audit log (read-only) and archives it to S3 Object Lock. Holds the only S3 credentials.
+  audit-shipper:
+    build: .
+    command: ["python", "-m", "app.audit_shipper", "run"]
+    environment:
+      AUDIT_LOG_PATH: /data/audit.jsonl
+      AUDIT_SHIPPER_STATE_PATH: /state/shipper-state.json
+      AUDIT_S3_BUCKET: ${AUDIT_S3_BUCKET:-meta-audit-local}
+      AUDIT_S3_PREFIX: ${AUDIT_S3_PREFIX:-audit/meta-api-tester}
+      # Empty string = real AWS (credentials from env / instance role); unset = LocalStack.
+      AUDIT_S3_ENDPOINT_URL: ${AUDIT_S3_ENDPOINT_URL-http://localstack:4566}
+      AUDIT_S3_REGION: ${AUDIT_S3_REGION:-us-east-1}
+      AUDIT_S3_LOCK_MODE: ${AUDIT_S3_LOCK_MODE:-COMPLIANCE}
+      AUDIT_S3_RETENTION_DAYS: ${AUDIT_S3_RETENTION_DAYS:-1}
+      AUDIT_S3_KMS_KEY_ID: ${AUDIT_S3_KMS_KEY_ID:-}
+      AUDIT_SHIP_FLUSH_SECONDS: ${AUDIT_SHIP_FLUSH_SECONDS:-10}
+      AWS_ACCESS_KEY_ID: ${AUDIT_AWS_ACCESS_KEY_ID:-test}
+      AWS_SECRET_ACCESS_KEY: ${AUDIT_AWS_SECRET_ACCESS_KEY:-test}
+    volumes:
+      - audit-data:/data:ro
+      - shipper-state:/state
+    depends_on:
+      localstack: {condition: service_healthy}
+      app: {condition: service_started}
+
   alertmanager:
     image: prom/alertmanager:v0.28.1
     ports: ["9093:9093"]
@@ -87,3 +128,4 @@ services:
 
 volumes:
   audit-data:
+  shipper-state:

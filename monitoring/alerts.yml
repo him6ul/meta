@@ -71,3 +71,29 @@ groups:
         labels: {severity: warning}
         annotations:
           summary: "{{ $value }} denied API requests in 5m (bad or missing X-API-Key)"
+
+      - alert: AuditArchiveDiverged
+        expr: max(audit_ship_halted) == 1
+        labels: {severity: critical}
+        annotations:
+          summary: "Audit shipping HALTED: local audit log no longer chains onto the S3 archive (possible tampering) - see audit-shipper logs"
+
+      - alert: AuditArchiveLagging
+        expr: max(audit_ship_lag_records) > 0 and (time() - max(audit_ship_last_success_timestamp_seconds)) > 300
+        for: 2m
+        labels: {severity: warning}
+        annotations:
+          summary: "Audit records not archived to S3 for >5m ({{ $value }}s since last upload)"
+
+      - alert: AuditArchiveUploadFailures
+        expr: sum(increase(audit_ship_segments_total{outcome="failure"}[10m])) > 3
+        labels: {severity: warning}
+        annotations:
+          summary: "{{ $value }} audit segment uploads to S3 failed in 10m"
+
+      - alert: AuditShipperDown
+        expr: up{job="audit-shipper"} == 0
+        for: 2m
+        labels: {severity: critical}
+        annotations:
+          summary: "audit-shipper is down - audit records are not being archived"
