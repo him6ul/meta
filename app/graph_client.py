@@ -17,7 +17,7 @@ from typing import Any
 import httpx
 from opentelemetry import trace
 
-from app.audit import AuditLog, digest, sanitize
+from app.audit import AuditLog, AuditUnavailable, digest, sanitize
 from app.config import Settings
 from app.metrics import (
     META_ATTEMPTS,
@@ -27,6 +27,8 @@ from app.metrics import (
     META_LATENCY,
     META_RATE_LIMIT,
     META_REGAIN_ACCESS,
+    AUDIT_OUTCOME_UNRECORDED,
+    AUDIT_REFUSED,
     META_REQUESTS,
     META_RETRIES,
     normalize_endpoint,
@@ -170,6 +172,7 @@ class MetaGraphClient:
                  audit: AuditLog | None = None):
         self.settings = settings
         self.audit = audit
+        self._circuit_events: list[tuple[int, int, int]] = []
         self.breaker = CircuitBreaker(settings.meta_circuit_failure_threshold,
                                       settings.meta_circuit_reset_seconds,
                                       on_change=self._audit_circuit)
@@ -200,30 +203,45 @@ class MetaGraphClient:
                     CircuitBreaker.OPEN: "open"}
 
     def _audit_circuit(self, old: int, new: int, failures: int) -> None:
-        if self.audit:
-            self.audit.record("meta.circuit.state_changed", actor="system", resource="meta-graph-api",
-                              from_state=self._STATE_NAMES[old], to_state=self._STATE_NAMES[new],
-                              consecutive_failures=failures)
+        # Breaker callbacks are sync; queue and write them (durably) at the end of the call.
+        self._circuit_events.append((old, new, failures))
 
-    def _audit_call(self, method: str, path: str, params: dict | None, json_body: dict | None,
-                    outcome: str, attempts: int, status: str, duration_ms: float,
-                    err: MetaAPIError | None = None, result: dict | None = None,
-                    error: str | None = None) -> None:
+    async def _flush_circuit_events(self) -> None:
+        while self.audit and self._circuit_events:
+            old, new, failures = self._circuit_events.pop(0)
+            try:
+                await self.audit.arecord("meta.circuit.state_changed", actor="system",
+                                         resource="meta-graph-api", from_state=self._STATE_NAMES[old],
+                                         to_state=self._STATE_NAMES[new], consecutive_failures=failures)
+            except AuditUnavailable:
+                AUDIT_OUTCOME_UNRECORDED.labels("circuit").inc()
+                log.error("circuit state change not durably audited")
+
+    async def _audit_call(self, method: str, path: str, params: dict | None, json_body: dict | None,
+                          outcome: str, attempts: int, status: str, duration_ms: float,
+                          intent_seq: int | None, err: MetaAPIError | None = None,
+                          result: dict | None = None, error: str | None = None) -> None:
         if not self.audit:
             return
         object_ids = None
         if result:
             ids = [result.get("id")] + [m.get("id") for m in result.get("messages", []) if isinstance(m, dict)]
             object_ids = [i for i in ids if i] or None
-        self.audit.record(
-            f"meta.api.{method.lower()}", outcome=outcome, resource=path,
-            endpoint=normalize_endpoint(path), http_status=status, attempts=attempts,
-            duration_ms=round(duration_ms, 1), params=sanitize(params) or None,
-            body=digest(json.dumps(json_body, sort_keys=True)) if json_body else None,
-            result_object_ids=object_ids, error=error,
-            meta_error={"code": err.code, "subcode": err.subcode, "type": err.type,
-                        "fbtrace_id": err.fbtrace_id, "message": err.message} if err else None,
-        )
+        try:
+            await self.audit.arecord(
+                f"meta.api.{method.lower()}", outcome=outcome, resource=path, intent_seq=intent_seq,
+                endpoint=normalize_endpoint(path), http_status=status, attempts=attempts,
+                duration_ms=round(duration_ms, 1), params=sanitize(params) or None,
+                body=digest(json.dumps(json_body, sort_keys=True)) if json_body else None,
+                result_object_ids=object_ids, error=error,
+                meta_error={"code": err.code, "subcode": err.subcode, "type": err.type,
+                            "fbtrace_id": err.fbtrace_id, "message": err.message} if err else None,
+            )
+        except AuditUnavailable:
+            # The call already happened; its durable intent record proves the attempt. The missing
+            # outcome shows up as an open intent in the archive verifier.
+            AUDIT_OUTCOME_UNRECORDED.labels("meta_api").inc()
+            log.error("meta call outcome not durably audited", extra={"intent_seq": intent_seq})
 
     def _backoff(self, attempt: int, err: MetaAPIError | None) -> float:
         delay = min(self.settings.meta_backoff_max_seconds,
@@ -234,14 +252,34 @@ class MetaGraphClient:
 
     async def request(self, method: str, path: str, *, params: dict | None = None,
                       json_body: dict | None = None, token: str | None = None) -> dict[str, Any]:
+        intent_seq = None
+        if self.audit:
+            # Write-ahead: the intent must be durable before anything is sent to Meta.
+            try:
+                intent = await self.audit.arecord(
+                    f"meta.api.{method.lower()}.intent", resource=path, endpoint=normalize_endpoint(path),
+                    params=sanitize(params) or None,
+                    body=digest(json.dumps(json_body, sort_keys=True)) if json_body else None)
+            except AuditUnavailable:
+                AUDIT_REFUSED.labels("meta_api").inc()
+                META_REQUESTS.labels(normalize_endpoint(path), method, "none", "audit_refused").inc()
+                raise
+            intent_seq = intent["seq"]
+        try:
+            return await self._request(method, path, params, json_body, token, intent_seq)
+        finally:
+            await self._flush_circuit_events()
+
+    async def _request(self, method: str, path: str, params: dict | None, json_body: dict | None,
+                       token: str | None, intent_seq: int | None) -> dict[str, Any]:
         endpoint = normalize_endpoint(path)
         query = {**(params or {}), **self._auth_params(token)}
         last_status = "error"
         call_start = time.perf_counter()
 
-        def audit(outcome: str, attempts: int, status: str, **kw):
-            self._audit_call(method, path, params, json_body, outcome, attempts, status,
-                             (time.perf_counter() - call_start) * 1000, **kw)
+        async def audit(outcome: str, attempts: int, status: str, **kw):
+            await self._audit_call(method, path, params, json_body, outcome, attempts, status,
+                                   (time.perf_counter() - call_start) * 1000, intent_seq, **kw)
 
         with tracer.start_as_current_span(f"meta {method} {endpoint}") as span:
             span.set_attribute("meta.endpoint", endpoint)
@@ -250,7 +288,7 @@ class MetaGraphClient:
             except CircuitOpenError:
                 META_REQUESTS.labels(endpoint, method, "none", "circuit_open").inc()
                 span.set_attribute("meta.outcome", "circuit_open")
-                audit("circuit_open", 0, "none")
+                await audit("circuit_open", 0, "none")
                 raise
 
             for attempt in range(self.settings.meta_max_retries + 1):
@@ -273,7 +311,7 @@ class MetaGraphClient:
                     self.breaker.record_failure()
                     META_REQUESTS.labels(endpoint, method, reason, "failure").inc()
                     span.set_status(trace.StatusCode.ERROR, reason)
-                    audit("failure", attempt + 1, reason, error=repr(exc))
+                    await audit("failure", attempt + 1, reason, error=repr(exc))
                     raise
 
                 elapsed = time.perf_counter() - start
@@ -292,7 +330,7 @@ class MetaGraphClient:
                                                     "status": resp.status_code, "attempt": attempt,
                                                     "duration_ms": round(elapsed * 1000, 1)})
                     result = resp.json() if resp.content else {}
-                    audit("success", attempt + 1, status, result=result)
+                    await audit("success", attempt + 1, status, result=result)
                     return result
 
                 err = MetaAPIError.from_response(resp)
@@ -318,7 +356,7 @@ class MetaGraphClient:
                 outcome = "throttled" if err.is_throttle else "failure"
                 META_REQUESTS.labels(endpoint, method, status, outcome).inc()
                 span.set_status(trace.StatusCode.ERROR, str(err))
-                audit(outcome, attempt + 1, status, err=err)
+                await audit(outcome, attempt + 1, status, err=err)
                 raise err
 
         raise RuntimeError(f"unreachable (last_status={last_status})")

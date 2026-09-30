@@ -14,7 +14,8 @@ with fault injection, so the whole stack works before you have credentials.
                ├─► OTLP traces ──► Jaeger :16686
                ├─► JSON logs (stdout, trace_id-correlated, tokens redacted)
                └─► audit trail (append-only, hash-chained JSONL, /api/audit)
-                        └─(read-only)─► audit-shipper ──► S3 Object Lock (WORM, LocalStack locally)
+                        ├─ sync, before each action ─► audit gateway ─► S3 Object Lock  journal/<seq>.json
+                        └─ read-only tail ───────────► audit-shipper ─► S3 Object Lock  segments (batched)
 ```
 
 ## Quick start (mock Meta, no credentials needed)
@@ -157,6 +158,44 @@ Set API keys (or put an authenticating proxy in front) when the actor must be tr
 
 Records are also archived off-host to S3 Object Lock, below.
 
+## Synchronous audit journal (write-ahead, fail-closed)
+
+With `AUDIT_JOURNAL_URL` set (the default in docker-compose), nothing happens without an immutable
+off-host record of it. **There is no unshipped window.**
+
+Every record is appended locally and then sent to the **audit gateway** (`POST /v1/journal` on the
+audit-shipper sidecar). The gateway writes it to S3 as its own Object Lock object,
+`<prefix>/journal/<seq>.json`, and only then does the app continue. The write is conditional
+(`If-None-Match: *`), so an existing seq can never be overwritten. A retry of the same record is accepted
+as a duplicate; different content for an existing seq gets `409` and a logged rejection. The gateway also
+checks each record's hash and requires a bearer token (`AUDIT_JOURNAL_TOKEN`). The app still holds no S3
+credentials.
+
+| Step | Record | If it can't be made durable |
+|---|---|---|
+| request arrives | `http.request.received` | **503, handler never runs** |
+| before calling Meta | `meta.api.<method>.intent` | **503, Meta is never called** |
+| after Meta answers | `meta.api.<method>` (`intent_seq` →) | response returned (the action happened); `audit_outcome_unrecorded_total` + open intent in the verifier |
+| before responding | `http.request` (`received_seq` →) | response returned with `X-Audit-Outcome: unrecorded` |
+| webhook / Alertmanager delivery | `webhook.meta.*`, `alert.notification` | **503, so the sender redelivers** |
+| startup | `app.started` | the app doesn't start (retries for 30s) |
+
+When a write fails, the app appends a local `audit.journal.write_failed` marker naming the seq. The
+segment shipper still archives it, so every record's fate is explained.
+
+**Bounded refusals:** each record gets one total budget (`AUDIT_JOURNAL_TIMEOUT_SECONDS`, 2s) across
+retries. The gateway has its own hard 1.5s deadline on the S3 write, because boto's timeouts don't bound a
+PutObject to a hung peer. Clients and webhook senders get their 503 fast. The gateway's `/ready` goes red
+after a failed S3 write, which makes the app's `/ready` fail and takes it out of rotation.
+
+**Cost:** about 4 journal writes per API request (received, intent, outcome, completion). Measured locally
+under load, the journal adds **p95 ≈ 17 ms per record**. Journal objects are ~1 KB, so the Terraform
+lifecycle transitions only segments (>128 KB) to Glacier IR. Set `AUDIT_JOURNAL_URL=` (empty) to fall
+back to batched-only shipping.
+
+Alerts: `AuditJournalRefusingActions` (critical), `AuditOutcomeUnrecorded`, `AuditJournalSlow` (p95 >
+500 ms). Dashboard: journal latency, gateway write outcomes, refused and unrecorded actions.
+
 ## Audit archive: S3 Object Lock (`app/audit_shipper.py`)
 
 A separate **audit-shipper** container tails the audit log (mounted **read-only**) and uploads it as
@@ -183,7 +222,14 @@ s3://<bucket>/audit/meta-api-tester/2026/09/29/000000000001-000000000036.jsonl
 
 **Verifier** (`make audit-verify-s3`, or `python -m app.audit_shipper verify [--compare-local FILE]`)
 reads **every object version**, checks each segment's SHA-256, confirms each has an unexpired lock, rebuilds
-the chain from seq 1, and reports gaps, conflicting duplicates and local mismatches. It also reads
+the chain from seq 1, and reports gaps, conflicting duplicates and local mismatches. It also cross-checks
+the journal against the segments:
+- `journal_mismatches`: the same seq with a different hash
+- `journal_conflicts`: more than one version for a seq
+- `not_journaled`: records archived from the file that never passed through the gateway and aren't
+  explained by a `write_failed` marker, meaning something was written directly on the host
+- `open_intents`: durable intents older than 5 minutes with no outcome. This is a warning; it means the
+  action's result is unknown. It also reads
 through **delete markers**: a plain DELETE on a locked bucket is allowed but only hides the version. The
 locked record is still verified and the marker is reported as a delete attempt. Exit code 1 if anything is
 off.
@@ -222,14 +268,15 @@ shipper the IAM role.
 > or removed by anyone, including the AWS root account, until retention expires. You'll pay to store every
 > object for the full period. Switch deliberately.
 
-Remaining trust boundary: records written locally but not yet shipped (≤10s by default) exist only on the
-host. For zero-window capture, have the app write synchronously to S3 or a stream (e.g. Kinesis/Firehose).
+Trust boundary: the app is the author of records, so a fully compromised app can still write *false*
+records (it holds the journal token). It can't remove, reorder or rewrite anything already journaled, and
+it can't act without first leaving a durable intent.
 and periodically anchor the `head_hash` externally, since a local file can be replaced wholesale.
 
 ## Local dev
 
 ```bash
-make install && make test     # 29 tests, pytest + respx
+make install && make test     # 39 tests, pytest + respx
 make mock &                   # mock on :8081
 META_GRAPH_BASE_URL=http://localhost:8081 META_ACCESS_TOKEN=x make run
 ```

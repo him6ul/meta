@@ -97,3 +97,22 @@ groups:
         labels: {severity: critical}
         annotations:
           summary: "audit-shipper is down - audit records are not being archived"
+
+      - alert: AuditJournalRefusingActions
+        expr: sum(increase(audit_refused_actions_total[5m])) > 0
+        labels: {severity: critical}
+        annotations:
+          summary: "{{ $value }} actions refused in 5m because the S3 audit journal is unavailable (fail-closed)"
+
+      - alert: AuditOutcomeUnrecorded
+        expr: sum(increase(audit_outcome_unrecorded_total[10m])) > 0
+        labels: {severity: warning}
+        annotations:
+          summary: "{{ $value }} actions completed but their outcome record is not durable (intent-only in archive)"
+
+      - alert: AuditJournalSlow
+        expr: histogram_quantile(0.95, sum by (le) (rate(audit_journal_write_duration_seconds_bucket[5m]))) > 0.5
+        for: 5m
+        labels: {severity: warning}
+        annotations:
+          summary: "Synchronous audit journal p95 {{ $value | humanizeDuration }} - every request pays this latency"

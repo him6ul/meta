@@ -1,3 +1,4 @@
+import asyncio
 import hmac
 import logging
 import time
@@ -9,10 +10,11 @@ from fastapi.responses import JSONResponse, Response
 from prometheus_client import CONTENT_TYPE_LATEST, generate_latest
 
 from app import routes, webhooks
-from app.audit import AuditLog, digest, new_request_id, request_context, sanitize
+from app.audit import (AuditLog, AuditUnavailable, JournalClient, digest, new_request_id, request_context,
+                       sanitize)
 from app.config import get_settings
 from app.graph_client import CircuitBreaker, CircuitOpenError, MetaAPIError, MetaGraphClient
-from app.metrics import HTTP_LATENCY, HTTP_REQUESTS
+from app.metrics import AUDIT_OUTCOME_UNRECORDED, AUDIT_REFUSED, HTTP_LATENCY, HTTP_REQUESTS
 from app.observability import setup_logging, setup_tracing
 
 log = logging.getLogger("app")
@@ -34,22 +36,44 @@ def resolve_actor(request: Request, api_keys: dict[str, str]) -> tuple[str | Non
     return (f"unverified:{claimed}" if claimed else "anonymous"), True
 
 
-def create_app(transport: httpx.AsyncBaseTransport | None = None) -> FastAPI:
+AUDIT_UNAVAILABLE_BODY = {"error": "audit trail unavailable: action refused (fail-closed)"}
+
+
+def create_app(transport: httpx.AsyncBaseTransport | None = None,
+               journal_transport: httpx.AsyncBaseTransport | None = None) -> FastAPI:
     settings = get_settings()
     setup_logging(settings)
-    audit = AuditLog(settings.audit_log_path)
+    journal = (JournalClient(settings.audit_journal_url, settings.audit_journal_token,
+                             timeout=settings.audit_journal_timeout_seconds, transport=journal_transport)
+               if settings.audit_journal_url else None)
+    audit = AuditLog(settings.audit_log_path, journal=journal)
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
         app.state.meta = MetaGraphClient(settings, transport=transport, audit=audit)
-        audit.record("app.started", actor="system", resource="meta-api-tester",
-                     graph_url=settings.graph_url, api_key_auth=bool(settings.api_keys),
-                     token_configured=bool(settings.meta_access_token),
-                     app_secret_configured=bool(settings.meta_app_secret))
-        log.info("started", extra={"graph_url": settings.graph_url})
+        # Refuse to start serving until the journal accepts records (the gateway may still be booting).
+        for attempt in range(30):
+            try:
+                await audit.arecord("app.started", actor="system", resource="meta-api-tester",
+                                    graph_url=settings.graph_url, api_key_auth=bool(settings.api_keys),
+                                    audit_journal=bool(journal),
+                                    token_configured=bool(settings.meta_access_token),
+                                    app_secret_configured=bool(settings.meta_app_secret))
+                break
+            except AuditUnavailable:
+                if attempt == 29:
+                    raise
+                log.warning("audit journal not ready; retrying startup")
+                await asyncio.sleep(1)
+        log.info("started", extra={"graph_url": settings.graph_url, "audit_journal": bool(journal)})
         yield
-        audit.record("app.stopped", actor="system", resource="meta-api-tester")
+        try:
+            await audit.arecord("app.stopped", actor="system", resource="meta-api-tester")
+        except AuditUnavailable:
+            log.error("app.stopped not durably audited")
         await app.state.meta.aclose()
+        if journal:
+            await journal.aclose()
 
     app = FastAPI(title="Meta API Tester", version="1.1.0", lifespan=lifespan,
                   description="Test harness for Meta Graph API (WhatsApp, Pages, Instagram) with "
@@ -69,14 +93,42 @@ def create_app(transport: httpx.AsyncBaseTransport | None = None) -> FastAPI:
                              "ip": request.client.host if request.client else None,
                              "user_agent": request.headers.get("user-agent")})
         body = await request.body() if audited and request.method in ("POST", "PUT", "PATCH", "DELETE") else b""
+        query = sanitize(dict(request.query_params)) or None
         status = 500
+        response = None
         try:
-            if not authenticated:
-                status = 401
-                response = JSONResponse(status_code=401, content={"error": "missing or invalid X-API-Key"})
-            else:
-                response = await call_next(request)
-                status = response.status_code
+            received_seq = None
+            if audited:
+                # Write-ahead gate: the request is durably recorded before any handler runs.
+                try:
+                    received = await audit.arecord("http.request.received", resource=path,
+                                                   method=request.method, query=query, body=digest(body))
+                    received_seq = received["seq"]
+                except AuditUnavailable:
+                    AUDIT_REFUSED.labels("http_request").inc()
+                    status = 503
+                    response = JSONResponse(status_code=503, content=AUDIT_UNAVAILABLE_BODY)
+            if response is None:
+                if not authenticated:
+                    status = 401
+                    response = JSONResponse(status_code=401, content={"error": "missing or invalid X-API-Key"})
+                else:
+                    response = await call_next(request)
+                    status = response.status_code
+                if audited:
+                    # Durable before the client sees the response.
+                    route = request.scope.get("route")
+                    outcome = ("denied" if status in (401, 403) else
+                               "success" if status < 400 else "failure")
+                    try:
+                        await audit.arecord(
+                            "http.request", outcome=outcome, resource=path, method=request.method,
+                            route=route.path if route is not None else "unmatched", http_status=status,
+                            duration_ms=round((time.perf_counter() - start) * 1000, 1), query=query,
+                            body=digest(body), received_seq=received_seq)
+                    except AuditUnavailable:
+                        AUDIT_OUTCOME_UNRECORDED.labels("http_request").inc()
+                        response.headers["x-audit-outcome"] = "unrecorded"
             response.headers["x-request-id"] = request_id
             return response
         finally:
@@ -86,18 +138,16 @@ def create_app(transport: httpx.AsyncBaseTransport | None = None) -> FastAPI:
             if path != "/metrics":
                 HTTP_REQUESTS.labels(label, request.method, str(status)).inc()
                 HTTP_LATENCY.labels(label, request.method).observe(elapsed)
-            if audited:
-                outcome = ("denied" if status in (401, 403) else
-                           "success" if status < 400 else "failure")
-                audit.record("http.request", outcome=outcome, resource=path, method=request.method,
-                             route=label, http_status=status, duration_ms=round(elapsed * 1000, 1),
-                             query=sanitize(dict(request.query_params)) or None, body=digest(body))
 
     @app.exception_handler(MetaAPIError)
     async def meta_error(_: Request, exc: MetaAPIError):
         # Surface Meta's error body; map throttling to 429 and Meta 5xx to 502.
         status = 429 if exc.is_throttle else (502 if exc.status >= 500 else exc.status)
         return JSONResponse(status_code=status, content={"error": exc.as_dict()})
+
+    @app.exception_handler(AuditUnavailable)
+    async def audit_unavailable(_: Request, exc: AuditUnavailable):
+        return JSONResponse(status_code=503, content=AUDIT_UNAVAILABLE_BODY)
 
     @app.exception_handler(CircuitOpenError)
     async def circuit_open(_: Request, exc: CircuitOpenError):
@@ -119,6 +169,8 @@ def create_app(transport: httpx.AsyncBaseTransport | None = None) -> FastAPI:
             "circuit_closed": meta.breaker.state != CircuitBreaker.OPEN,
             "audit_log_writable": audit.writable(),
         }
+        if journal:
+            checks["audit_journal_reachable"] = await journal.healthy()
         ok = all(checks.values())
         return JSONResponse(status_code=200 if ok else 503, content={"ready": ok, "checks": checks})
 

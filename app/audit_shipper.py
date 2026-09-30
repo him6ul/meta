@@ -1,9 +1,16 @@
-"""Ship the hash-chained audit log to S3 with Object Lock (WORM), and verify what was shipped.
+"""Audit gateway + shipper: durable S3 Object Lock (WORM) storage for the hash-chained audit log.
+
+Two write paths, both into the same locked bucket:
+- **Journal (synchronous).** `POST /v1/journal`. The app sends every record *before* it proceeds and
+  waits for this service to write it as `<prefix>/journal/<seq>.json` (conditional write: an existing seq
+  can never be overwritten). This closes the window between an action and its off-host record.
+- **Segments (batched).** The shipper loop tails the local file and writes compact, verifier-friendly
+  segments, and detects any local rewrite of history.
 
 Runs as a sidecar with its own S3 credentials and a read-only view of the audit log, so the app
 never holds credentials that could alter the archive.
 
-  python -m app.audit_shipper run                         # tail + ship forever
+  python -m app.audit_shipper run                         # gateway (:9102) + segment shipper
   python -m app.audit_shipper verify [--compare-local F]  # audit the archive
 
 Each segment is an immutable object `<prefix>/YYYY/MM/DD/<first_seq>-<last_seq>.jsonl` written with
@@ -21,6 +28,7 @@ Safety rules:
 import argparse
 import base64
 import hashlib
+import hmac
 import json
 import logging
 import os
@@ -32,10 +40,17 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
+import threading
+from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import TimeoutError as FutureTimeout
+
 import boto3
+import uvicorn
 from botocore.config import Config
 from botocore.exceptions import BotoCoreError, ClientError
-from prometheus_client import Counter, Gauge, start_http_server
+from fastapi import Body, FastAPI, Header, HTTPException
+from fastapi.responses import JSONResponse
+from prometheus_client import Counter, Gauge, Histogram, make_asgi_app
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 from app.audit import GENESIS_HASH, link_ok
@@ -49,6 +64,11 @@ SHIPPED_SEQ = Gauge("audit_ship_last_shipped_seq", "Highest audit seq durably ar
 SOURCE_SEQ = Gauge("audit_ship_source_seq", "Highest audit seq seen in the local log")
 LAG = Gauge("audit_ship_lag_records", "Records written locally but not yet archived")
 HALTED = Gauge("audit_ship_halted", "1 when shipping stopped because the local chain diverged")
+JOURNAL_WRITES = Counter("audit_gateway_journal_writes_total", "Journal write requests", ["outcome"])
+for _outcome in ("success", "failure", "reused"):
+    SEGMENTS.labels(_outcome)
+JOURNAL_S3_LATENCY = Histogram("audit_gateway_s3_put_duration_seconds", "S3 PutObject latency for journal records",
+                               buckets=(0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2))
 
 
 class ShipperSettings(BaseSettings):
@@ -62,6 +82,9 @@ class ShipperSettings(BaseSettings):
     audit_s3_region: str = "us-east-1"
     audit_s3_lock_mode: str = "GOVERNANCE"   # COMPLIANCE in production: nobody, incl. root, can shorten it
     audit_s3_retention_days: int = 365
+    audit_s3_journal_retention_days: int | None = None  # defaults to audit_s3_retention_days
+    audit_journal_token: str = ""            # bearer token the app must present to the gateway
+    audit_journal_put_timeout_seconds: float = 1.5  # hard deadline; keep below the app's journal budget
     audit_s3_kms_key_id: str = ""            # SSE-KMS key; empty = bucket default encryption
     audit_ship_batch_max_records: int = 500
     audit_ship_flush_seconds: float = 10.0
@@ -88,7 +111,8 @@ def audit_event(action: str, stream=None, **details: Any) -> None:
 
 
 def make_s3(s: ShipperSettings):
-    cfg = Config(retries={"mode": "standard", "max_attempts": 5},
+    # Tight timeouts: the journal path is synchronous and must fail fast inside the app's budget.
+    cfg = Config(retries={"mode": "standard", "max_attempts": 2}, connect_timeout=1, read_timeout=2,
                  s3={"addressing_style": "path"} if s.audit_s3_endpoint_url else None)
     return boto3.client("s3", endpoint_url=s.audit_s3_endpoint_url or None,
                         region_name=s.audit_s3_region, config=cfg)
@@ -281,8 +305,10 @@ def verify_archive(settings: ShipperSettings, s3=None, compare_local: str | None
     s3 = s3 or make_s3(settings)
     bucket, prefix = settings.audit_s3_bucket, settings.audit_s3_prefix.strip("/") + "/"
     by_seq: dict[int, dict] = {}
+    journal: dict[int, dict] = {}
     report: dict[str, Any] = {"bucket": bucket, "prefix": prefix, "objects": 0, "conflicts": [],
-                              "unlocked_objects": [], "checksum_mismatches": [], "delete_markers": []}
+                              "unlocked_objects": [], "checksum_mismatches": [], "delete_markers": [],
+                              "journal_conflicts": [], "journal_invalid": [], "warnings": []}
 
     # Walk every version, not just current objects: a plain DELETE on a locked bucket is allowed but only
     # adds a delete marker that hides the (still locked) version. Read through it and report the marker.
@@ -303,6 +329,14 @@ def verify_archive(settings: ShipperSettings, s3=None, compare_local: str | None
                 report["unlocked_objects"].append({"key": key, "reason": "no retention"})
             elif until <= datetime.now(timezone.utc):
                 report["unlocked_objects"].append({"key": key, "reason": "retention expired"})
+            if "/journal/" in key:
+                rec = json.loads(body)
+                if not link_ok(rec.get("prev_hash"), rec):
+                    report["journal_invalid"].append(key)
+                elif rec["seq"] in journal and journal[rec["seq"]]["hash"] != rec["hash"]:
+                    report["journal_conflicts"].append({"seq": rec["seq"], "key": key})
+                journal.setdefault(rec["seq"], rec)
+                continue
             for line in body.splitlines():
                 if not line.strip():
                     continue
@@ -326,6 +360,38 @@ def verify_archive(settings: ShipperSettings, s3=None, compare_local: str | None
     report.update(records=len(by_seq), head_seq=head, head_hash=by_seq[head]["hash"] if head else None,
                   gaps=gaps, first_bad_seq=first_bad)
 
+    # --- journal vs segments ---
+    report["journal_records"] = len(journal)
+    report["journal_mismatches"] = [q for q, r in journal.items() if q in by_seq and by_seq[q]["hash"] != r["hash"]]
+    report["journal_only"] = sum(1 for q in journal if q not in by_seq)   # not yet segmented: normal
+    combined = {**journal, **by_seq}
+    if journal:
+        # Once journaling started, every archived record must also be in the journal, unless it is a
+        # local-only `audit.journal.write_failed` marker or the record that marker explains. Anything else
+        # was written to the file without going through the gateway (e.g. injected on the host).
+        first_journaled = min(journal)
+        explained = {r["details"].get("failed_seq") for r in combined.values()
+                     if r["action"] == "audit.journal.write_failed"}
+        report["not_journaled"] = sorted(
+            q for q, r in by_seq.items()
+            if q > first_journaled and q not in journal and q not in explained
+            and r["action"] != "audit.journal.write_failed")[:50]
+    else:
+        report["not_journaled"] = []
+
+    # --- write-ahead intents without an outcome (crash between action and outcome, or in flight) ---
+    done = {r["details"].get(k) for r in combined.values() for k in ("intent_seq", "received_seq")}
+    failed = {r["details"].get("failed_seq") for r in combined.values()
+              if r["action"] == "audit.journal.write_failed"}
+    cutoff = datetime.now(timezone.utc) - timedelta(minutes=5)
+    open_intents = [{"seq": q, "action": r["action"], "resource": r.get("resource"), "ts": r["ts"]}
+                    for q, r in sorted(combined.items())
+                    if (r["action"].endswith(".intent") or r["action"] == "http.request.received")
+                    and q not in done and q not in failed and datetime.fromisoformat(r["ts"]) < cutoff]
+    report["open_intents"] = open_intents[:50]
+    if open_intents:
+        report["warnings"].append(f"{len(open_intents)} durable intents have no recorded outcome")
+
     if compare_local:
         mismatches, local_head = [], 0
         with open(compare_local, encoding="utf-8") as f:
@@ -334,17 +400,115 @@ def verify_archive(settings: ShipperSettings, s3=None, compare_local: str | None
                     continue
                 rec = json.loads(line)
                 local_head = rec["seq"]
-                archived = by_seq.get(rec["seq"])
+                archived = by_seq.get(rec["seq"]) or journal.get(rec["seq"])
                 if archived is not None and archived["hash"] != rec["hash"]:
                     mismatches.append(rec["seq"])
-        report["local"] = {"head_seq": local_head, "unshipped": max(0, local_head - head),
+        report["local"] = {"head_seq": local_head, "unshipped": max(0, local_head - max(head, max(journal, default=0))),
                            "mismatched_seqs": mismatches[:20], "mismatch_count": len(mismatches),
-                           "missing_locally": max(0, head - local_head)}
+                           "missing_locally": max(0, max(head, max(journal, default=0)) - local_head)}
 
     report["ok"] = not (report["conflicts"] or report["unlocked_objects"] or report["checksum_mismatches"]
-                        or report["delete_markers"] or first_bad or (compare_local and (report["local"]["mismatch_count"]
+                        or report["delete_markers"] or first_bad or report["journal_conflicts"]
+                        or report["journal_invalid"] or report["journal_mismatches"] or report["not_journaled"] or (compare_local and (report["local"]["mismatch_count"]
                                                             or report["local"]["missing_locally"])))
     return report
+
+
+# ---------- synchronous journal gateway ----------
+def journal_key(settings: ShipperSettings, seq: int) -> str:
+    return f"{settings.audit_s3_prefix.strip('/')}/journal/{seq:012d}.json"
+
+
+def create_gateway(settings: ShipperSettings, s3=None, shipper: "Shipper | None" = None) -> FastAPI:
+    s3 = s3 or make_s3(settings)
+    retention_days = settings.audit_s3_journal_retention_days or settings.audit_s3_retention_days
+    app = FastAPI(title="Audit gateway", docs_url=None, redoc_url=None)
+    app.mount("/metrics", make_asgi_app())
+
+    def reject(status: int, reason: str, **details: Any):
+        JOURNAL_WRITES.labels(reason).inc()
+        audit_event("audit.journal.rejected", reason=reason, **details)
+        raise HTTPException(status_code=status, detail=reason)
+
+    s3_state = {"last_ok": 0.0, "last_error": 0.0}
+    # boto's own timeouts don't bound a PutObject against a hung peer (100-continue, retries), so each
+    # put runs under a hard deadline. A put that lands after we gave up is harmless: the app has already
+    # refused the action and logged `audit.journal.write_failed` for that seq, which the verifier accepts.
+    put_pool = ThreadPoolExecutor(max_workers=32, thread_name_prefix="journal-put")
+
+    @app.get("/health")
+    def health():
+        """Liveness only."""
+        return {"status": "ok", "shipper_halted": bool(shipper and shipper.halt_reason)}
+
+    @app.get("/ready")
+    def ready():
+        """Not ready while the most recent S3 write failed (within 30s): the app then reports not-ready
+        instead of discovering the outage one refused request at a time."""
+        degraded = s3_state["last_error"] > s3_state["last_ok"] and time.time() - s3_state["last_error"] < 30
+        return JSONResponse(status_code=503 if degraded else 200,
+                            content={"ready": not degraded, "last_s3_ok": s3_state["last_ok"],
+                                     "last_s3_error": s3_state["last_error"]})
+
+    # Sync def: FastAPI runs it in a threadpool, so blocking boto3 calls don't stall other writes.
+    @app.post("/v1/journal", status_code=201)
+    def put_journal(record: dict = Body(...), authorization: str = Header("")):
+        token = settings.audit_journal_token
+        if not token or not hmac.compare_digest(authorization, f"Bearer {token}"):
+            reject(401, "unauthorized")
+        seq = record.get("seq")
+        if not isinstance(seq, int) or seq < 1 or not isinstance(record.get("action"), str):
+            reject(400, "malformed", seq=seq)
+        if not link_ok(record.get("prev_hash"), record):
+            reject(400, "hash_invalid", seq=seq)
+
+        body = (json.dumps(record, sort_keys=True, separators=(",", ":")) + "\n").encode()
+        sha256 = hashlib.sha256(body).hexdigest()
+        key = journal_key(settings, seq)
+        params: dict[str, Any] = dict(
+            Bucket=settings.audit_s3_bucket, Key=key, Body=body, ContentType="application/json",
+            IfNoneMatch="*",   # never overwrite an existing seq
+            ContentMD5=base64.b64encode(hashlib.md5(body).digest()).decode(), ChecksumAlgorithm="SHA256",
+            ObjectLockMode=settings.audit_s3_lock_mode,
+            ObjectLockRetainUntilDate=datetime.now(timezone.utc) + timedelta(days=retention_days),
+            Metadata={"seq": str(seq), "hash": record["hash"], "sha256": sha256},
+        )
+        if settings.audit_s3_kms_key_id:
+            params.update(ServerSideEncryption="aws:kms", SSEKMSKeyId=settings.audit_s3_kms_key_id)
+        start = time.perf_counter()
+        try:
+            resp = put_pool.submit(s3.put_object, **params).result(
+                timeout=settings.audit_journal_put_timeout_seconds)
+        except FutureTimeout:
+            JOURNAL_WRITES.labels("s3_timeout").inc()
+            s3_state["last_error"] = time.time()
+            log.error("journal put exceeded %.1fs deadline (seq %s)", settings.audit_journal_put_timeout_seconds, seq)
+            raise HTTPException(status_code=503, detail="s3 timeout")
+        except ClientError as e:
+            code = e.response.get("Error", {}).get("Code")
+            if code in ("PreconditionFailed", "412", "ConditionalRequestConflict"):
+                existing = s3.head_object(Bucket=settings.audit_s3_bucket, Key=key)
+                if existing.get("Metadata", {}).get("sha256") == sha256:
+                    JOURNAL_WRITES.labels("duplicate").inc()   # retry of a write that already landed
+                    return JSONResponse(status_code=200, content={"key": key, "version_id": existing.get("VersionId"),
+                                                                  "duplicate": True})
+                reject(409, "seq_conflict", seq=seq, key=key)
+            JOURNAL_WRITES.labels("s3_error").inc()
+            s3_state["last_error"] = time.time()
+            log.error("journal put failed: %r", e)
+            raise HTTPException(status_code=503, detail=f"s3 error: {code}")
+        except BotoCoreError as e:
+            JOURNAL_WRITES.labels("s3_error").inc()
+            s3_state["last_error"] = time.time()
+            log.error("journal put failed: %r", e)
+            raise HTTPException(status_code=503, detail="s3 unreachable")
+        finally:
+            JOURNAL_S3_LATENCY.observe(time.perf_counter() - start)
+        JOURNAL_WRITES.labels("success").inc()
+        s3_state["last_ok"] = time.time()
+        return {"key": key, "version_id": resp.get("VersionId"), "sha256": sha256}
+
+    return app
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -360,8 +524,11 @@ def main(argv: list[str] | None = None) -> int:
         print("AUDIT_S3_BUCKET is required", file=sys.stderr)
         return 2
     if args.cmd == "run":
-        start_http_server(settings.audit_ship_metrics_port)
-        Shipper(settings).run_forever()
+        s3 = make_s3(settings)
+        shipper = Shipper(settings, s3=s3)
+        threading.Thread(target=shipper.run_forever, name="segment-shipper", daemon=True).start()
+        uvicorn.run(create_gateway(settings, s3=s3, shipper=shipper), host="0.0.0.0",
+                    port=settings.audit_ship_metrics_port, log_level="warning")
         return 0
     report = verify_archive(settings, compare_local=args.compare_local)
     audit_event("audit.archive.verified", stream=sys.stderr, ok=report["ok"], head_seq=report["head_seq"],

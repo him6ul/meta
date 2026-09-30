@@ -29,6 +29,10 @@ class Settings(BaseSettings):
     # name becomes the audited actor. Unset = open access, actor taken from X-Actor (unverified).
     audit_log_path: str = "data/audit.jsonl"
     app_api_keys: str = ""
+    # Synchronous off-host journal (audit gateway in the audit-shipper sidecar). Unset = local-only.
+    audit_journal_url: str = ""
+    audit_journal_token: str = ""
+    audit_journal_timeout_seconds: float = 2.0
 
     log_level: str = "INFO"
     otel_exporter_otlp_endpoint: str = ""

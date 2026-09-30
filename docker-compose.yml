@@ -19,14 +19,22 @@ services:
       OTEL_EXPORTER_OTLP_ENDPOINT: http://jaeger:4318
       AUDIT_LOG_PATH: /data/audit.jsonl
       APP_API_KEYS: ${APP_API_KEYS:-}
+      # Synchronous journal: every record is in S3 Object Lock before the action proceeds (fail-closed).
+      # Set AUDIT_JOURNAL_URL= (empty) to fall back to batched shipping only.
+      AUDIT_JOURNAL_URL: ${AUDIT_JOURNAL_URL-http://audit-shipper:9102}
+      AUDIT_JOURNAL_TOKEN: ${AUDIT_JOURNAL_TOKEN:-local-dev-journal-token}
     volumes:
       - audit-data:/data
+    restart: unless-stopped
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request;urllib.request.urlopen('http://localhost:8000/health')"]
       interval: 10s
       timeout: 3s
       retries: 5
-    depends_on: [mock-meta, jaeger]
+    depends_on:
+      mock-meta: {condition: service_started}
+      jaeger: {condition: service_started}
+      audit-shipper: {condition: service_healthy}
 
   mock-meta:
     build: .
@@ -58,7 +66,8 @@ services:
       timeout: 5s
       retries: 30
 
-  # Tails the audit log (read-only) and archives it to S3 Object Lock. Holds the only S3 credentials.
+  # Audit gateway (synchronous journal, :9102) + segment shipper. Holds the only S3 credentials;
+  # sees the audit log read-only.
   audit-shipper:
     build: .
     command: ["python", "-m", "app.audit_shipper", "run"]
@@ -76,12 +85,18 @@ services:
       AUDIT_SHIP_FLUSH_SECONDS: ${AUDIT_SHIP_FLUSH_SECONDS:-10}
       AWS_ACCESS_KEY_ID: ${AUDIT_AWS_ACCESS_KEY_ID:-test}
       AWS_SECRET_ACCESS_KEY: ${AUDIT_AWS_SECRET_ACCESS_KEY:-test}
+      AUDIT_JOURNAL_TOKEN: ${AUDIT_JOURNAL_TOKEN:-local-dev-journal-token}
     volumes:
       - audit-data:/data:ro
       - shipper-state:/state
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request;urllib.request.urlopen('http://localhost:9102/health')"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    restart: unless-stopped
     depends_on:
       localstack: {condition: service_healthy}
-      app: {condition: service_started}
 
   alertmanager:
     image: prom/alertmanager:v0.28.1

@@ -66,6 +66,15 @@ WEBHOOK_VERIFICATIONS = Counter(
 # --- Audit trail ---
 AUDIT_EVENTS = Counter("audit_events_total", "Audit records written", ["action", "outcome"])
 AUDIT_WRITE_FAILURES = Counter("audit_write_failures_total", "Audit records that could not be persisted")
+AUDIT_JOURNAL_LATENCY = Histogram("audit_journal_write_duration_seconds",
+                                  "Synchronous off-host (S3 Object Lock) journal write latency",
+                                  buckets=(0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2))
+AUDIT_JOURNAL_FAILURES = Counter("audit_journal_failures_total", "Failed journal write attempts", ["reason"])
+AUDIT_REFUSED = Counter("audit_refused_actions_total",
+                        "Actions refused because their audit record could not be made durable", ["kind"])
+AUDIT_OUTCOME_UNRECORDED = Counter("audit_outcome_unrecorded_total",
+                                   "Actions that happened but whose outcome record could not be made durable",
+                                   ["kind"])
 
 # --- Alert notifications ---
 ALERT_NOTIFICATIONS = Counter("alert_notifications_total", "Alertmanager notifications received",
@@ -91,3 +100,13 @@ def normalize_endpoint(path: str) -> str:
     if parts and re.fullmatch(r"v\d+\.\d+", parts[0]):
         parts = parts[1:]
     return "/" + "/".join("{id}" if _ID_SEGMENT.match(p) else p for p in parts)
+
+
+# Pre-create labelled series at 0: Prometheus increase() ignores the first sample of a new series, so
+# an alert on "any refusal" would otherwise miss the first burst.
+for _kind in ("http_request", "meta_api", "webhook"):
+    AUDIT_REFUSED.labels(_kind)
+for _kind in ("http_request", "meta_api", "circuit"):
+    AUDIT_OUTCOME_UNRECORDED.labels(_kind)
+for _reason in ("unreachable", "503", "400", "401", "409"):
+    AUDIT_JOURNAL_FAILURES.labels(_reason)

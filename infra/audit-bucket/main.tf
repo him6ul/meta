@@ -73,8 +73,12 @@ resource "aws_s3_bucket_lifecycle_configuration" "audit" {
   rule {
     id     = "archive"
     status = "Enabled"
+    # Segments only: journal records are ~1 KB and Glacier IR bills a 128 KB minimum per object.
     filter {
-      prefix = "${var.prefix}/"
+      and {
+        prefix                   = "${var.prefix}/"
+        object_size_greater_than = 131072
+      }
     }
     transition {
       days          = var.archive_transition_days
