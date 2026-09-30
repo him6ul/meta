@@ -152,13 +152,25 @@ async def instagram_media(request: Request, limit: int = 10):
 @router.get("/audit", tags=["audit"])
 async def audit_query(request: Request, limit: int = 100, action: str | None = None,
                       actor: str | None = None, request_id: str | None = None,
-                      outcome: str | None = None):
-    """Newest-first audit records. `action` matches exactly or as a prefix (e.g. `meta.api`)."""
-    return request.app.state.audit.query(limit=min(limit, 1000), action=action, actor=actor,
-                                         request_id=request_id, outcome=outcome)
+                      outcome: str | None = None, replica: str | None = None):
+    """Newest-first audit records. `action` matches exactly or as a prefix (e.g. `meta.api`).
+    Gateway mode: the global chain across ALL replicas (from the gateway index)."""
+    audit = request.app.state.audit
+    if audit.gateway is not None:
+        return await audit.gateway.query(limit=min(limit, 1000), action=action, actor=actor,
+                                         request_id=request_id, outcome=outcome, replica=replica)
+    return audit.query(limit=min(limit, 1000), action=action, actor=actor, request_id=request_id, outcome=outcome)
 
 
 @router.get("/audit/verify", tags=["audit"])
 async def audit_verify(request: Request):
-    """Recompute the hash chain; `ok: false` means records were altered, removed or reordered."""
-    return request.app.state.audit.verify()
+    """Local mode: recompute the local hash chain. Gateway mode: the latest archive verification plus a
+    check of this replica's cache against the authoritative chain."""
+    audit = request.app.state.audit
+    if audit.gateway is None:
+        return audit.verify()
+    last = await audit.gateway.last_verification()
+    cache = await audit.cache_consistency()
+    archive = None if last is None else {k: last.get(k) for k in ("ok", "verified_at", "head_seq", "blocks", "findings", "open_intent_count")}
+    ok = (archive is None or archive["ok"]) and not cache["mismatched_seqs"] and not cache["unknown_to_gateway"]
+    return {"ok": ok, "mode": "gateway", "replica": audit.replica, "archive": archive, "replica_cache": cache}

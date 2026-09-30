@@ -2,7 +2,7 @@
   "uid": "meta-api",
   "title": "Meta Graph API",
   "schemaVersion": 39,
-  "version": 6,
+  "version": 7,
   "refresh": "10s",
   "time": {
     "from": "now-30m",
@@ -638,7 +638,7 @@
     },
     {
       "id": 16,
-      "title": "Audit seq: written vs archived to S3",
+      "title": "Audit records committed / s by replica",
       "type": "timeseries",
       "datasource": {
         "type": "prometheus",
@@ -653,8 +653,41 @@
       "targets": [
         {
           "refId": "A",
-          "expr": "max(audit_ship_source_seq)",
-          "legendFormat": "written locally",
+          "expr": "sum by (replica) (rate(audit_gateway_records_committed_total[1m]))",
+          "legendFormat": "{{replica}}",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          }
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "reqps"
+        },
+        "overrides": []
+      },
+      "options": {}
+    },
+    {
+      "id": 17,
+      "title": "Records per block (p50 / p95)",
+      "type": "timeseries",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "x": 8,
+        "y": 44,
+        "w": 4,
+        "h": 8
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "histogram_quantile(0.5, sum by (le) (rate(audit_gateway_batch_records_bucket[5m])))",
+          "legendFormat": "p50",
           "datasource": {
             "type": "prometheus",
             "uid": "prometheus"
@@ -662,8 +695,8 @@
         },
         {
           "refId": "B",
-          "expr": "max(audit_ship_last_shipped_seq)",
-          "legendFormat": "archived (Object Lock)",
+          "expr": "histogram_quantile(0.95, sum by (le) (rate(audit_gateway_batch_records_bucket[5m])))",
+          "legendFormat": "p95",
           "datasource": {
             "type": "prometheus",
             "uid": "prometheus"
@@ -679,66 +712,9 @@
       "options": {}
     },
     {
-      "id": 17,
-      "title": "Archive lag (records)",
-      "type": "stat",
-      "datasource": {
-        "type": "prometheus",
-        "uid": "prometheus"
-      },
-      "gridPos": {
-        "x": 8,
-        "y": 44,
-        "w": 4,
-        "h": 8
-      },
-      "targets": [
-        {
-          "refId": "A",
-          "expr": "max(audit_ship_lag_records)",
-          "legendFormat": "lag",
-          "datasource": {
-            "type": "prometheus",
-            "uid": "prometheus"
-          }
-        }
-      ],
-      "fieldConfig": {
-        "defaults": {
-          "unit": "short",
-          "thresholds": {
-            "mode": "absolute",
-            "steps": [
-              {
-                "color": "green",
-                "value": null
-              },
-              {
-                "color": "orange",
-                "value": 500
-              },
-              {
-                "color": "red",
-                "value": 5000
-              }
-            ]
-          }
-        },
-        "overrides": []
-      },
-      "options": {
-        "colorMode": "background",
-        "reduceOptions": {
-          "calcs": [
-            "lastNotNull"
-          ]
-        }
-      }
-    },
-    {
       "id": 18,
-      "title": "Since last S3 upload",
-      "type": "stat",
+      "title": "Commit wait p95 (draft -> sequenced)",
+      "type": "timeseries",
       "datasource": {
         "type": "prometheus",
         "uid": "prometheus"
@@ -752,7 +728,7 @@
       "targets": [
         {
           "refId": "A",
-          "expr": "time() - max(audit_ship_last_success_timestamp_seconds)",
+          "expr": "histogram_quantile(0.95, sum by (le) (rate(audit_gateway_draft_wait_seconds_bucket[5m])))",
           "legendFormat": "",
           "datasource": {
             "type": "prometheus",
@@ -762,39 +738,15 @@
       ],
       "fieldConfig": {
         "defaults": {
-          "unit": "s",
-          "thresholds": {
-            "mode": "absolute",
-            "steps": [
-              {
-                "color": "green",
-                "value": null
-              },
-              {
-                "color": "orange",
-                "value": 120
-              },
-              {
-                "color": "red",
-                "value": 300
-              }
-            ]
-          }
+          "unit": "s"
         },
         "overrides": []
       },
-      "options": {
-        "colorMode": "background",
-        "reduceOptions": {
-          "calcs": [
-            "lastNotNull"
-          ]
-        }
-      }
+      "options": {}
     },
     {
       "id": 19,
-      "title": "Archive integrity",
+      "title": "Sequencer head / conflicts",
       "type": "stat",
       "datasource": {
         "type": "prometheus",
@@ -809,8 +761,17 @@
       "targets": [
         {
           "refId": "A",
-          "expr": "max(audit_ship_halted)",
-          "legendFormat": "",
+          "expr": "audit_gateway_head_seq",
+          "legendFormat": "head seq",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          }
+        },
+        {
+          "refId": "B",
+          "expr": "sum(increase(audit_gateway_sequencer_conflicts_total[10m]))",
+          "legendFormat": "conflicts (10m)",
           "datasource": {
             "type": "prometheus",
             "uid": "prometheus"
@@ -819,44 +780,11 @@
       ],
       "fieldConfig": {
         "defaults": {
-          "unit": "short",
-          "thresholds": {
-            "mode": "absolute",
-            "steps": [
-              {
-                "color": "green",
-                "value": null
-              },
-              {
-                "color": "red",
-                "value": 1
-              }
-            ]
-          },
-          "mappings": [
-            {
-              "type": "value",
-              "options": {
-                "0": {
-                  "text": "CHAIN INTACT"
-                },
-                "1": {
-                  "text": "HALTED - DIVERGED"
-                }
-              }
-            }
-          ]
+          "unit": "short"
         },
         "overrides": []
       },
-      "options": {
-        "colorMode": "background",
-        "reduceOptions": {
-          "calcs": [
-            "lastNotNull"
-          ]
-        }
-      }
+      "options": {}
     },
     {
       "id": 20,
@@ -902,7 +830,7 @@
     },
     {
       "id": 21,
-      "title": "Journal writes by outcome (gateway)",
+      "title": "Drafts rejected by reason (gateway)",
       "type": "timeseries",
       "datasource": {
         "type": "prometheus",
@@ -917,8 +845,17 @@
       "targets": [
         {
           "refId": "A",
-          "expr": "sum by (outcome) (rate(audit_gateway_journal_writes_total[1m]))",
-          "legendFormat": "{{outcome}}",
+          "expr": "sum by (reason) (rate(audit_gateway_drafts_rejected_total[1m]))",
+          "legendFormat": "{{reason}}",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          }
+        },
+        {
+          "refId": "B",
+          "expr": "sum(rate(audit_gateway_blocks_committed_total[1m]))",
+          "legendFormat": "blocks committed",
           "datasource": {
             "type": "prometheus",
             "uid": "prometheus"

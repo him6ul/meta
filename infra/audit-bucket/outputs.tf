@@ -6,15 +6,15 @@ output "kms_key_arn" {
   value = aws_kms_key.audit.arn
 }
 
-output "shipper_policy_arn" {
-  value = aws_iam_policy.shipper.arn
+output "gateway_policy_arn" {
+  value = aws_iam_policy.gateway.arn
 }
 
 output "verifier_policy_arn" {
   value = aws_iam_policy.verifier.arn
 }
 
-output "shipper_env" {
+output "gateway_env" {
   description = "Values for .env"
   value = {
     AUDIT_S3_BUCKET         = aws_s3_bucket.audit.id

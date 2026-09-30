@@ -31,13 +31,13 @@ variable "lock_mode" {
 variable "retention_days" {
   type        = number
   default     = 365
-  description = "Default retention applied to every object version (the shipper also sets it explicitly per object)."
+  description = "Default retention applied to every object version (the gateway also sets it explicitly per block)."
 }
 
-variable "shipper_principal_arns" {
+variable "gateway_principal_arns" {
   type        = list(string)
   default     = []
-  description = "IAM roles/users that run the audit shipper (write-only). Attach aws_iam_policy.shipper otherwise."
+  description = "IAM roles that run the audit gateway (sequencer). Attach aws_iam_policy.gateway otherwise."
 }
 
 variable "break_glass_principal_arns" {

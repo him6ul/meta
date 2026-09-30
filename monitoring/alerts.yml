@@ -64,7 +64,7 @@ groups:
         expr: sum(increase(audit_write_failures_total[5m])) > 0
         labels: {severity: critical}
         annotations:
-          summary: "Audit records are failing to persist - actions are not being recorded"
+          summary: "Audit writes failing locally (local mode: records lost; gateway mode: replica cache only)"
 
       - alert: UnauthenticatedApiAccess
         expr: sum(increase(audit_events_total{action="http.request", outcome="denied"}[5m])) > 10
@@ -72,31 +72,31 @@ groups:
         annotations:
           summary: "{{ $value }} denied API requests in 5m (bad or missing X-API-Key)"
 
-      - alert: AuditArchiveDiverged
-        expr: max(audit_ship_halted) == 1
+      - alert: AuditGatewayDown
+        expr: up{job="audit-gateway"} == 0
+        for: 1m
         labels: {severity: critical}
         annotations:
-          summary: "Audit shipping HALTED: local audit log no longer chains onto the S3 archive (possible tampering) - see audit-shipper logs"
+          summary: "audit-gateway is down - every replica is refusing actions (fail-closed)"
 
-      - alert: AuditArchiveLagging
-        expr: max(audit_ship_lag_records) > 0 and (time() - max(audit_ship_last_success_timestamp_seconds)) > 300
-        for: 2m
+      - alert: AuditSequencerConflicts
+        expr: sum(increase(audit_gateway_sequencer_conflicts_total[10m])) > 0
         labels: {severity: warning}
         annotations:
-          summary: "Audit records not archived to S3 for >5m ({{ $value }}s since last upload)"
+          summary: "Block slots taken by another writer ({{ $value }} in 10m): a second gateway is running, or an abandoned write was adopted"
 
-      - alert: AuditArchiveUploadFailures
-        expr: sum(increase(audit_ship_segments_total{outcome="failure"}[10m])) > 3
-        labels: {severity: warning}
-        annotations:
-          summary: "{{ $value }} audit segment uploads to S3 failed in 10m"
-
-      - alert: AuditShipperDown
-        expr: up{job="audit-shipper"} == 0
-        for: 2m
+      - alert: AuditGatewayCommitFailures
+        expr: sum(increase(audit_gateway_drafts_rejected_total{reason=~"s3_error|deadline"}[5m])) > 0
         labels: {severity: critical}
         annotations:
-          summary: "audit-shipper is down - audit records are not being archived"
+          summary: "{{ $value }} audit drafts not committed in 5m (S3 unavailable or too slow)"
+
+      - alert: AuditGatewayCommitSlow
+        expr: histogram_quantile(0.95, sum by (le) (rate(audit_gateway_draft_wait_seconds_bucket[5m]))) > 0.25
+        for: 5m
+        labels: {severity: warning}
+        annotations:
+          summary: "Audit commit p95 {{ $value | humanizeDuration }} - every action pays this latency"
 
       - alert: AuditJournalRefusingActions
         expr: sum(increase(audit_refused_actions_total[5m])) > 0
@@ -121,7 +121,7 @@ groups:
         expr: audit_archive_verify_ok == 0
         labels: {severity: critical}
         annotations:
-          summary: "Scheduled audit archive verification FAILED - check audit-shipper /verify/last"
+          summary: "Scheduled audit archive verification FAILED - check audit-gateway /verify/last"
 
       - alert: AuditArchiveVerifyStale
         expr: time() - audit_archive_verify_last_run_timestamp_seconds > 2700

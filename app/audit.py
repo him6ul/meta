@@ -8,10 +8,10 @@ Records hold who/what/when/outcome plus identifiers (request_id, trace_id, fbtra
 Payloads are stored as a SHA-256 digest + size, never verbatim, so message content (PII) and secrets
 stay out of the trail while still letting you prove what was sent if you hold the original.
 
-Synchronous journal (AUDIT_JOURNAL_URL): `arecord()` appends locally, then waits until the record is
-durably written off-host (one S3 Object Lock object per record, via the audit gateway) before returning.
-If that fails it raises AuditUnavailable, and callers refuse the action (fail closed). Combined with
-write-ahead intent records, no side effect happens without an immutable off-host record of it.
+Gateway mode (AUDIT_JOURNAL_URL): `arecord()` sends an unsequenced draft to the audit gateway, which
+sequences records from ALL app replicas into one chain and commits them to S3 Object Lock before
+returning. If that fails it raises AuditUnavailable, and callers refuse the action (fail closed).
+Combined with write-ahead intent records, no side effect happens without an immutable off-host record.
 """
 import asyncio
 import hashlib
@@ -72,19 +72,20 @@ class AuditUnavailable(Exception):
     """The record could not be made durable; the caller must not perform (or acknowledge) the action."""
 
 
-class JournalClient:
-    """Sends each record to the audit gateway, which writes it to S3 Object Lock before answering."""
+class GatewayClient:
+    """Talks to the audit gateway, the global sequencer. A draft is durable (in an S3 Object Lock block) and
+    sequenced when `append` returns."""
 
-    def __init__(self, url: str, token: str, timeout: float = 3.0, retries: int = 2,
+    def __init__(self, url: str, token: str, timeout: float = 2.0, retries: int = 2,
                  transport: httpx.AsyncBaseTransport | None = None):
         self.timeout = timeout   # total budget per record, across retries
         self.retries = retries
         self._http = httpx.AsyncClient(base_url=url.rstrip("/"), timeout=timeout, transport=transport,
                                        headers={"authorization": f"Bearer {token}"})
 
-    async def put(self, entry: dict[str, Any]) -> dict[str, Any]:
-        """Retry transient failures within ONE overall deadline, so a refusal is fast (webhook senders and
-        clients get their 503 well before their own timeouts)."""
+    async def append(self, draft: dict[str, Any]) -> dict[str, Any]:
+        """Retry transient failures within ONE overall deadline. Retries are safe: the gateway dedups by
+        draft_id, so a retry of a draft that did commit returns the same record."""
         deadline = time.monotonic() + self.timeout
         last_error, attempt = "unknown", 0
         while True:
@@ -93,8 +94,7 @@ class JournalClient:
                 break
             start = time.perf_counter()
             try:
-                resp = await asyncio.wait_for(self._http.post("/v1/journal", json=entry, timeout=remaining),
-                                              remaining)
+                resp = await asyncio.wait_for(self._http.post("/v2/records", json=draft, timeout=remaining), remaining)
             except (httpx.HTTPError, asyncio.TimeoutError) as exc:
                 last_error, reason = repr(exc), "unreachable"
             else:
@@ -110,14 +110,28 @@ class JournalClient:
                 break
             await asyncio.sleep(min(0.05 * (2 ** attempt), max(0.0, deadline - time.monotonic())))
             attempt += 1
-        raise AuditUnavailable(f"journal write failed for seq {entry.get('seq')}: {last_error}")
+        raise AuditUnavailable(f"gateway did not commit {draft.get('action')} ({draft.get('draft_id')}): {last_error}")
+
+    async def query(self, **params: Any) -> list[dict[str, Any]]:
+        resp = await self._http.get("/v2/records", params={k: v for k, v in params.items() if v is not None})
+        resp.raise_for_status()
+        return resp.json()
+
+    async def hashes(self, seqs: list[int]) -> dict[int, str]:
+        resp = await self._http.post("/v2/records/hashes", json=seqs)
+        resp.raise_for_status()
+        return {int(k): v for k, v in resp.json().items()}
+
+    async def last_verification(self) -> dict[str, Any] | None:
+        resp = await self._http.get("/verify/last")
+        return resp.json() if resp.status_code == 200 else None
 
     def set_token(self, token: str) -> None:
         """Called on secret rotation."""
         self._http.headers["authorization"] = f"Bearer {token}"
 
     async def healthy(self) -> bool:
-        """Gateway /ready: up AND able to write to S3 recently."""
+        """Gateway /ready: up AND able to commit to S3 recently."""
         try:
             return (await self._http.get("/ready", timeout=1.0)).status_code == 200
         except httpx.HTTPError:
@@ -128,13 +142,23 @@ class JournalClient:
 
 
 class AuditLog:
-    def __init__(self, path: str, journal: JournalClient | None = None):
-        self.journal = journal
+    """Two modes.
+
+    - Local (no gateway): this process assigns seq/hash and appends to a local hash-chained file.
+      Single writer only; for development and tests.
+    - Gateway: this process builds an *unsequenced* draft; the audit gateway assigns seq/prev_hash/hash
+      across all replicas and commits it to S3 Object Lock before returning it. The local file is then a
+      per-replica cache of this replica's records (non-contiguous seqs); the archive is the truth.
+    """
+
+    def __init__(self, path: str, gateway: GatewayClient | None = None, replica: str | None = None):
+        self.gateway = gateway
+        self.replica = replica
         self.path = Path(path)
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self._lock = threading.Lock()
         self.last_write_ok = True
-        self._seq, self._prev_hash = self._load_tail()
+        self._seq, self._prev_hash = self._load_tail() if gateway is None else (0, GENESIS_HASH)
 
     def _load_tail(self) -> tuple[int, str]:
         if not self.path.exists() or self.path.stat().st_size == 0:
@@ -147,12 +171,11 @@ class AuditLog:
         rec = json.loads(last)
         return rec["seq"], rec["hash"]
 
-    def record(self, action: str, *, outcome: str = "success", actor: str | None = None,
-               resource: str | None = None, **details: Any) -> dict[str, Any] | None:
-        """Local append only (no off-host guarantee). Returns None if the write failed."""
+    def _draft(self, action: str, outcome: str, actor: str | None, resource: str | None,
+               details: dict[str, Any]) -> dict[str, Any]:
         ctx = request_context.get()
         span_ctx = trace.get_current_span().get_span_context()
-        entry: dict[str, Any] = {
+        draft: dict[str, Any] = {
             "ts": datetime.now(timezone.utc).isoformat(),
             "action": action,
             "outcome": outcome,
@@ -164,14 +187,27 @@ class AuditLog:
             "resource": resource,
             "details": {k: v for k, v in details.items() if v is not None},
         }
+        if self.replica:
+            draft["replica"] = self.replica
+        return draft
+
+    def _append_line(self, entry: dict[str, Any]) -> None:
+        with self.path.open("a", encoding="utf-8") as f:
+            f.write(json.dumps(entry, default=str) + "\n")
+            f.flush()
+
+    def record(self, action: str, *, outcome: str = "success", actor: str | None = None,
+               resource: str | None = None, **details: Any) -> dict[str, Any] | None:
+        """Local mode only: sequence + append locally. Returns None if the write failed."""
+        if self.gateway is not None:
+            raise RuntimeError("AuditLog.record() is local-mode only; use arecord() with a gateway")
+        entry = self._draft(action, outcome, actor, resource, details)
         try:
             with self._lock:
                 entry["seq"] = self._seq + 1
                 entry["prev_hash"] = self._prev_hash
                 entry["hash"] = _chain_hash(self._prev_hash, entry)
-                with self.path.open("a", encoding="utf-8") as f:
-                    f.write(json.dumps(entry, default=str) + "\n")
-                    f.flush()
+                self._append_line(entry)
                 self._seq, self._prev_hash = entry["seq"], entry["hash"]
         except OSError:
             self.last_write_ok = False
@@ -183,25 +219,44 @@ class AuditLog:
         log.info("audit", extra={"audit": entry})
         return entry
 
-    async def arecord(self, action: str, **kw: Any) -> dict[str, Any]:
-        """Append locally, then (if a journal is configured) wait for the durable off-host write.
-
-        Raises AuditUnavailable if the record isn't durable. Callers treat that as "don't act".
-        """
-        entry = self.record(action, **kw)
-        if entry is None:
-            raise AuditUnavailable(f"local audit write failed for {action}")
-        if self.journal is not None:
-            try:
-                receipt = await self.journal.put(entry)
-            except AuditUnavailable as exc:
-                # Local-only marker so the archive explains why this seq has no journal object.
-                self.record("audit.journal.write_failed", outcome="failure", actor="system",
-                            resource=action, failed_seq=entry["seq"], error=str(exc))
-                log.error("audit journal write failed", extra={"audit_action": action, "seq": entry["seq"]})
-                raise
-            entry = {**entry, "_journal": receipt}
+    async def arecord(self, action: str, *, outcome: str = "success", actor: str | None = None,
+                      resource: str | None = None, **details: Any) -> dict[str, Any]:
+        """Durably record, then return the sequenced record. Raises AuditUnavailable if it isn't durable;
+        callers treat that as "don't act"."""
+        if self.gateway is None:
+            entry = self.record(action, outcome=outcome, actor=actor, resource=resource, **details)
+            if entry is None:
+                raise AuditUnavailable(f"local audit write failed for {action}")
+            return entry
+        draft = self._draft(action, outcome, actor, resource, details)
+        draft["draft_id"] = uuid.uuid4().hex
+        try:
+            entry = await self.gateway.append(draft)
+        except AuditUnavailable:
+            log.error("audit record not committed", extra={"audit_action": action, "draft_id": draft["draft_id"]})
+            raise
+        try:
+            with self._lock:
+                self._append_line(entry)   # cache only; the committed record is already durable off-host
+            self.last_write_ok = True
+        except OSError:
+            self.last_write_ok = False
+            AUDIT_WRITE_FAILURES.inc()
+            log.exception("audit cache write failed (record is committed)", extra={"seq": entry.get("seq")})
+        AUDIT_EVENTS.labels(action, outcome).inc()
+        log.info("audit", extra={"audit": entry})
         return entry
+
+    async def cache_consistency(self) -> dict[str, Any]:
+        """Gateway mode: check this replica's cached records against the authoritative chain."""
+        cached = {r["seq"]: r["hash"] for r in self._iter()}
+        if not cached:
+            return {"records": 0, "mismatched_seqs": [], "unknown_to_gateway": []}
+        authoritative = await self.gateway.hashes(sorted(cached)[-5000:])
+        checked = sorted(cached)[-5000:]
+        return {"records": len(cached), "checked": len(checked),
+                "mismatched_seqs": [q for q in checked if q in authoritative and authoritative[q] != cached[q]][:50],
+                "unknown_to_gateway": [q for q in checked if q not in authoritative][:50]}
 
     def writable(self) -> bool:
         """Used by /ready: an instance that can't record actions shouldn't receive traffic."""

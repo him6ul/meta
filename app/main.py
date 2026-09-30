@@ -10,7 +10,7 @@ from fastapi.responses import JSONResponse, Response
 from prometheus_client import CONTENT_TYPE_LATEST, generate_latest
 
 from app import routes, webhooks
-from app.audit import (AuditLog, AuditUnavailable, JournalClient, digest, new_request_id, request_context,
+from app.audit import (AuditLog, AuditUnavailable, GatewayClient, digest, new_request_id, request_context,
                        sanitize)
 from app.config import get_settings
 from app.graph_client import CircuitBreaker, CircuitOpenError, MetaAPIError, MetaGraphClient
@@ -56,10 +56,12 @@ def create_app(transport: httpx.AsyncBaseTransport | None = None,
                                 region=settings.secrets_manager_region,
                                 endpoint_url=settings.secrets_manager_endpoint_url, client=secrets_client)
         secrets.load()
-    journal = (JournalClient(settings.audit_journal_url, settings.audit_journal_token,
+    journal = (GatewayClient(settings.audit_journal_url, settings.audit_journal_token,
                              timeout=settings.audit_journal_timeout_seconds, transport=journal_transport)
                if settings.audit_journal_url else None)
-    audit = AuditLog(settings.audit_log_path, journal=journal)
+    replica = settings.replica_id
+    audit = AuditLog(settings.audit_log_path.replace("{replica}", replica), gateway=journal,
+                     replica=replica if journal else None)
     rotations: list[dict[str, str]] = []
 
     def on_secret_change(changed: dict[str, str]) -> None:
@@ -97,7 +99,7 @@ def create_app(transport: httpx.AsyncBaseTransport | None = None,
             try:
                 await audit.arecord("app.started", actor="system", resource="meta-api-tester",
                                     graph_url=settings.graph_url, api_key_auth=bool(settings.api_keys),
-                                    audit_journal=bool(journal),
+                                    audit_journal=bool(journal), replica=replica,
                                     token_configured=bool(settings.meta_access_token),
                                     app_secret_configured=bool(settings.meta_app_secret))
                 break
@@ -224,8 +226,9 @@ def create_app(transport: httpx.AsyncBaseTransport | None = None,
         checks = {
             "access_token_configured": bool(settings.meta_access_token),
             "circuit_closed": meta.breaker.state != CircuitBreaker.OPEN,
-            "audit_log_writable": audit.writable(),
         }
+        if not journal:   # local mode: the file IS the audit trail
+            checks["audit_log_writable"] = audit.writable()
         if journal:
             checks["audit_journal_reachable"] = await journal.healthy()
         if settings.meta_webhook_require_signature:

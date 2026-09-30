@@ -1,4 +1,4 @@
-.PHONY: contract token-status delivery-stats verify-last install test run mock up down load chaos-errors chaos-outage chaos-throttle chaos-reset webhook audit audit-verify slack audit-verify-s3 audit-archive-ls audit-archive-reset-local
+.PHONY: scale contract token-status delivery-stats verify-last install test run mock up down load chaos-errors chaos-outage chaos-throttle chaos-reset webhook audit audit-verify slack audit-verify-s3 audit-archive-ls audit-archive-reset-local
 
 install:
 	python3 -m venv .venv && .venv/bin/pip install -r requirements-dev.txt
@@ -46,14 +46,14 @@ slack:      ## messages received by the fake Slack endpoint
 	curl -s localhost:8081/_mock/slack | python3 -m json.tool
 
 audit-verify-s3:   ## verify the S3 Object Lock archive end-to-end and against the local log
-	docker compose exec -T audit-shipper python -m app.audit_shipper verify --compare-local /data/audit.jsonl
+	docker compose exec -T audit-gateway sh -c 'python -m app.audit_gateway verify --compare-local /replicas/audit-*.jsonl'
 
 audit-archive-ls:
 	docker compose exec -T localstack awslocal s3api list-object-versions --bucket meta-audit-local \
-	  --query '{versions: Versions[].[Key,VersionId], delete_markers: DeleteMarkers[].[Key,VersionId]}'
+	  --prefix audit/meta-api-tester/blocks/ --query '{versions: Versions[].[Key,Size], delete_markers: DeleteMarkers[].[Key,VersionId]}'
 
-audit-archive-reset-local:   ## LocalStack only: wipe the ephemeral archive and the shipper checkpoint
-	docker compose rm -sf localstack audit-shipper && docker volume rm -f meta_shipper-state && docker compose up -d
+audit-archive-reset-local:   ## LocalStack only: wipe the ephemeral archive and the gateway index
+	docker compose rm -sf localstack audit-gateway && docker volume rm -f meta_gateway-state && docker compose up -d
 
 contract:   ## live contract tests against the real Meta API (needs META_LIVE_* env; see tests/contract)
 	.venv/bin/pytest -m live tests/contract -v
@@ -64,5 +64,8 @@ token-status:
 delivery-stats:
 	curl -s localhost:8000/api/whatsapp/delivery-stats | python3 -m json.tool
 
-verify-last:   ## latest scheduled archive verification (runs in the sidecar every AUDIT_VERIFY_INTERVAL_SECONDS)
-	docker compose exec -T audit-shipper python -c "import urllib.request as u;print(u.urlopen('http://localhost:9102/verify/last').read().decode())" | python3 -m json.tool
+verify-last:   ## latest scheduled archive verification (runs in the gateway every AUDIT_VERIFY_INTERVAL_SECONDS)
+	docker compose exec -T audit-gateway python -c "import urllib.request as u;print(u.urlopen('http://localhost:9102/verify/last').read().decode())" | python3 -m json.tool
+
+scale:   ## run N app replicas behind the load balancer, e.g. make scale N=4
+	docker compose up -d --scale app=$${N:-3} --no-recreate

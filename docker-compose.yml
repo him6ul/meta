@@ -6,9 +6,15 @@ x-common-env: &meta-env
   META_APP_SECRET: ${META_APP_SECRET:-mock-app-secret}
 
 services:
+  # N stateless app replicas behind `lb`. The audit chain is sequenced by audit-gateway, so replicas
+  # never coordinate with each other. Scale with: docker compose up -d --scale app=3
   app:
     build: .
-    ports: ["8000:8000"]
+    deploy:
+      replicas: ${APP_REPLICAS:-2}
+    # Trust X-Forwarded-For from the load balancer so audit records keep the real client IP.
+    command: ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000",
+              "--proxy-headers", "--forwarded-allow-ips", "*"]
     env_file: [{path: .env, required: false}]
     environment:
       <<: *meta-env
@@ -19,12 +25,15 @@ services:
       META_PAGE_ID: ${META_PAGE_ID:-2000001}
       INSTAGRAM_ACCOUNT_ID: ${INSTAGRAM_ACCOUNT_ID:-17841400000}
       OTEL_EXPORTER_OTLP_ENDPOINT: http://jaeger:4318
-      AUDIT_LOG_PATH: /data/audit.jsonl
+      # Per-replica cache of that replica's committed records (the archive is the source of truth).
+      AUDIT_LOG_PATH: /data/audit-{replica}.jsonl
       APP_API_KEYS: ${APP_API_KEYS:-}
-      # Synchronous journal: every record is in S3 Object Lock before the action proceeds (fail-closed).
-      # Set AUDIT_JOURNAL_URL= (empty) to fall back to batched shipping only.
-      AUDIT_JOURNAL_URL: ${AUDIT_JOURNAL_URL-http://audit-shipper:9102}
+      # Every record is sequenced by the gateway and committed to S3 Object Lock before the action
+      # proceeds (fail-closed). AUDIT_JOURNAL_URL= (empty) = local single-writer mode (dev only).
+      AUDIT_JOURNAL_URL: ${AUDIT_JOURNAL_URL-http://audit-gateway:9102}
       AUDIT_JOURNAL_TOKEN: ${AUDIT_JOURNAL_TOKEN:-local-dev-journal-token}
+      # Shared by all replicas (a redelivery or status webhook can land on any replica).
+      # SQLite on one host's volume is fine locally; use Redis/Postgres across hosts.
       META_WEBHOOK_DEDUP_PATH: /data/webhook_dedup.sqlite
       WHATSAPP_DELIVERY_DB_PATH: /data/deliveries.sqlite
       META_TOKEN_CHECK_INTERVAL_SECONDS: ${META_TOKEN_CHECK_INTERVAL_SECONDS:-300}
@@ -46,7 +55,20 @@ services:
     depends_on:
       mock-meta: {condition: service_started}
       jaeger: {condition: service_started}
-      audit-shipper: {condition: service_healthy}
+      audit-gateway: {condition: service_healthy}
+
+  lb:
+    image: nginx:1.29-alpine
+    ports: ["8000:8000"]
+    volumes:
+      - ./lb/nginx.conf:/etc/nginx/nginx.conf:ro
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:8000/lb/health"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    depends_on:
+      app: {condition: service_healthy}
 
   mock-meta:
     build: .
@@ -54,13 +76,13 @@ services:
     ports: ["8081:8081"]
     environment:
       <<: *meta-env
-      MOCK_WEBHOOK_TARGET: http://app:8000/webhooks/meta
+      MOCK_WEBHOOK_TARGET: http://lb:8000/webhooks/meta
 
   loadgen:
     build: .
     profiles: [load]
-    command: ["python", "scripts/loadgen.py", "--base", "http://app:8000", "--rps", "5", "--duration", "3600"]
-    depends_on: [app]
+    command: ["python", "scripts/loadgen.py", "--base", "http://lb:8000", "--rps", "5", "--duration", "3600"]
+    depends_on: [lb]
 
   # Local stand-in for S3 with Object Lock (enforces COMPLIANCE retention). Ephemeral: the archive is
   # lost when this container is recreated. Point AUDIT_S3_* at a real bucket for durable storage.
@@ -79,14 +101,13 @@ services:
       timeout: 5s
       retries: 30
 
-  # Audit gateway (synchronous journal, :9102) + segment shipper. Holds the only S3 credentials;
-  # sees the audit log read-only.
-  audit-shipper:
+  # Audit gateway: the single global sequencer for the audit chain (group-commits blocks to S3 Object
+  # Lock), global audit index/query API, scheduled archive verifier. Holds the only S3 credentials.
+  audit-gateway:
     build: .
-    command: ["python", "-m", "app.audit_shipper", "run"]
+    command: ["python", "-m", "app.audit_gateway", "run"]
     environment:
-      AUDIT_LOG_PATH: /data/audit.jsonl
-      AUDIT_SHIPPER_STATE_PATH: /state/shipper-state.json
+      AUDIT_GATEWAY_STATE_DIR: /state
       AUDIT_S3_BUCKET: ${AUDIT_S3_BUCKET:-meta-audit-local}
       AUDIT_S3_PREFIX: ${AUDIT_S3_PREFIX:-audit/meta-api-tester}
       # Empty string = real AWS (credentials from env / instance role); unset = LocalStack.
@@ -95,7 +116,7 @@ services:
       AUDIT_S3_LOCK_MODE: ${AUDIT_S3_LOCK_MODE:-COMPLIANCE}
       AUDIT_S3_RETENTION_DAYS: ${AUDIT_S3_RETENTION_DAYS:-1}
       AUDIT_S3_KMS_KEY_ID: ${AUDIT_S3_KMS_KEY_ID:-}
-      AUDIT_SHIP_FLUSH_SECONDS: ${AUDIT_SHIP_FLUSH_SECONDS:-10}
+      AUDIT_COMMIT_WINDOW_SECONDS: ${AUDIT_COMMIT_WINDOW_SECONDS:-0.005}
       AWS_ACCESS_KEY_ID: ${AUDIT_AWS_ACCESS_KEY_ID:-test}
       AWS_SECRET_ACCESS_KEY: ${AUDIT_AWS_SECRET_ACCESS_KEY:-test}
       AUDIT_JOURNAL_TOKEN: ${AUDIT_JOURNAL_TOKEN:-local-dev-journal-token}
@@ -104,8 +125,8 @@ services:
       SECRETS_MANAGER_ENDPOINT_URL: ${SECRETS_MANAGER_ENDPOINT_URL-http://localstack:4566}
       SECRETS_REFRESH_SECONDS: ${SECRETS_REFRESH_SECONDS:-60}
     volumes:
-      - audit-data:/data:ro
-      - shipper-state:/state
+      - gateway-state:/state
+      - audit-data:/replicas:ro   # only for `verify --compare-local /replicas/audit-*.jsonl`
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request;urllib.request.urlopen('http://localhost:9102/health')"]
       interval: 5s
@@ -177,5 +198,5 @@ services:
 
 volumes:
   audit-data:
-  shipper-state:
+  gateway-state:
   loki-data:

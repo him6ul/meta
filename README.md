@@ -5,17 +5,17 @@ Graph object) with production-style resilience and full observability. It ships 
 with fault injection, so the whole stack works before you have credentials.
 
 ```
- loadgen ──► app (FastAPI :8000) ──► Meta Graph API  (graph.facebook.com  or  mock-meta :8081)
-               │  ▲                        │
-               │  └── webhooks ◄───────────┘  (X-Hub-Signature-256 verified)
-               ├─► /metrics ──► Prometheus :9090 ──► Grafana :3000 (dashboard)
-               │                    └─► Alertmanager :9093 ──► Slack
-               │                                  └────────► app /webhooks/alertmanager (audited)
-               ├─► OTLP traces ──► Jaeger :16686
-               ├─► JSON logs (stdout, trace_id-correlated, tokens redacted)
-               └─► audit trail (append-only, hash-chained JSONL, /api/audit)
-                        ├─ sync, before each action ─► audit gateway ─► S3 Object Lock  journal/<seq>.json
-                        └─ read-only tail ───────────► audit-shipper ─► S3 Object Lock  segments (batched)
+ loadgen ──► lb (nginx :8000) ──► app replica 1..N (FastAPI) ──► Meta Graph API (graph.facebook.com | mock-meta)
+                                   │  ▲                                 │
+                                   │  └── webhooks (signed, deduped) ◄──┘
+                                   │
+                                   ├─ every action: unsequenced draft ─► audit-gateway :9102 ─► S3 Object Lock
+                                   │    (write-ahead, fail-closed)        global sequencer      blocks/<n>.jsonl
+                                   │                                      group commit, CAS     (If-None-Match)
+                                   │                                      index + query API, scheduled verifier
+                                   ├─► /metrics (per replica) ─► Prometheus ─► Grafana  ·  Alertmanager ─► Slack
+                                   ├─► OTLP traces ─► Jaeger          └─► JSON logs ─► Alloy ─► Loki
+                                   └─► replica cache of its own committed records (audit-<replica>.jsonl)
 ```
 
 ## Quick start (mock Meta, no credentials needed)
@@ -123,7 +123,7 @@ log as `whatsapp.message.failed`.
 - Stale readings expire, so an old high reading can't lock the app out.
 - Local refusals are audited (`outcome: local_rate_limited`).
 
-**Scheduled archive verification** runs in the sidecar every `AUDIT_VERIFY_INTERVAL_SECONDS` (15 min;
+**Scheduled archive verification** runs in the audit gateway every `AUDIT_VERIFY_INTERVAL_SECONDS` (15 min;
 5 min in compose). It's incremental: locked versions are immutable, so each version is downloaded and
 checked only once, and later runs just re-list (new versions, delete markers, vanished versions). Results go
 to `audit_archive_verify_*` metrics, `GET :9102/verify/last` (`make verify-last`), and alerts
@@ -224,105 +224,108 @@ Records carry `request_id` (echoed as `X-Request-ID`) and `trace_id`, so one API
 across the audit trail, logs and Jaeger. Tokens are masked, and request/message payloads are stored only as
 a SHA-256 digest + size: no PII or secrets in the trail, but a payload can still be proven against it.
 
-**Tamper evidence:** each record's `hash = sha256(prev_hash + record)`. `GET /api/audit/verify`
-recomputes the chain and reports the first altered, deleted or reordered record. **Availability:** a
-failed write increments `audit_write_failures_total` (critical alert) and makes `/ready` return 503. That
-takes the instance out of rotation instead of letting it act without a record.
+**Tamper evidence:** each record's `hash = sha256(prev_hash + record)`, so any edit, deletion or
+reordering breaks the chain.
+
+**Two modes:**
+- **Gateway mode** (the default in compose, and what you run in production): the audit gateway assigns
+  seq, `prev_hash` and `hash` for all replicas and commits them to S3 Object Lock before the action proceeds.
+  This is described below.
+- **Local mode** (`AUDIT_JOURNAL_URL` empty): a single process sequences records into its local file.
+  It's for development and tests only. Here `/api/audit/verify` recomputes the local chain, and a failed
+  write makes `/ready` return 503.
 
 **Identity:** without `APP_API_KEYS`, actors are self-declared (`X-Actor`) and labelled `unverified:`.
 Set API keys (or put an authenticating proxy in front) when the actor must be trustworthy.
 
 Records are also archived off-host to S3 Object Lock, below.
 
-## Synchronous audit journal (write-ahead, fail-closed)
+## Audit sequencing across replicas (`app/audit_gateway.py`)
 
-With `AUDIT_JOURNAL_URL` set (the default in docker-compose), nothing happens without an immutable
-off-host record of it. **There is no unshipped window.**
+The app is stateless and runs as N replicas behind `lb` (`APP_REPLICAS=2` by default;
+`make scale N=4`). The audit chain stays **one global, gapless, hash-chained sequence** because replicas
+never sequence anything themselves:
 
-Every record is appended locally and then sent to the **audit gateway** (`POST /v1/journal` on the
-audit-shipper sidecar). The gateway writes it to S3 as its own Object Lock object,
-`<prefix>/journal/<seq>.json`, and only then does the app continue. The write is conditional
-(`If-None-Match: *`), so an existing seq can never be overwritten. A retry of the same record is accepted
-as a duplicate; different content for an existing seq gets `409` and a logged rejection. The gateway also
-checks each record's hash and requires a bearer token (`AUDIT_JOURNAL_TOKEN`). The app still holds no S3
-credentials.
+1. A replica builds an **unsequenced draft** (who/what/when plus a random `draft_id`) and sends it to the
+   **audit gateway** (`POST /v2/records`).
+2. The gateway gathers concurrent drafts for a few milliseconds (`AUDIT_COMMIT_WINDOW_SECONDS`, group
+   commit), assigns consecutive seqs, chains them onto its head, and writes the batch as **one** locked
+   object `<prefix>/blocks/<block>.jsonl` with `If-None-Match: *`.
+3. Only once S3 confirms does each replica get its sequenced record back. The action proceeds, and the
+   replica appends the record to its local cache `audit-<replica>.jsonl`.
 
-| Step | Record | If it can't be made durable |
+**Why it can't fork, even with two gateways (split-brain):**
+- A block number is a compare-and-set slot. Only one writer can create block N; the loser gets 412,
+  reads the winning block, advances its head, and re-chains its drafts, which are still unsequenced, onto
+  it.
+- A commit whose outcome is unknown (a timeout) is resolved from S3 before the slot is reused, so an
+  abandoned write that lands late is adopted into the chain, not forked.
+- Retries are safe because the gateway deduplicates by `draft_id`.
+- On restart, the gateway finds the head from S3 (its index is only a cache).
+
+Measured live with 2 replicas:
+- 3,664 records in one gapless chain; both replica caches matched the archive exactly.
+- Commit wait p50 8 ms, p95 22 ms.
+- Forced split-brain (two gateways taking writes concurrently): 200 drafts, 25 slot conflicts, 200 unique
+  seqs, archive verified with no fork.
+
+| Step | Record | If the gateway can't commit it |
 |---|---|---|
 | request arrives | `http.request.received` | **503, handler never runs** |
 | before calling Meta | `meta.api.<method>.intent` | **503, Meta is never called** |
 | after Meta answers | `meta.api.<method>` (`intent_seq` →) | response returned (the action happened); `audit_outcome_unrecorded_total` + open intent in the verifier |
 | before responding | `http.request` (`received_seq` →) | response returned with `X-Audit-Outcome: unrecorded` |
 | webhook / Alertmanager delivery | `webhook.meta.*`, `alert.notification` | **503, so the sender redelivers** |
-| startup | `app.started` | the app doesn't start (retries for 30s) |
+| startup | `app.started` | the replica doesn't start |
 
-When a write fails, the app appends a local `audit.journal.write_failed` marker naming the seq. The
-segment shipper still archives it, so every record's fate is explained.
+**Bounded refusals:** each draft gets one total budget on the replica (`AUDIT_JOURNAL_TIMEOUT_SECONDS`,
+2s) and a hard 1.5s commit deadline in the gateway. The gateway's `/ready` goes red after a failed commit,
+so replicas report not-ready.
 
-**Bounded refusals:** each record gets one total budget (`AUDIT_JOURNAL_TIMEOUT_SECONDS`, 2s) across
-retries. The gateway has its own hard 1.5s deadline on the S3 write, because boto's timeouts don't bound a
-PutObject to a hung peer. Clients and webhook senders get their 503 fast. The gateway's `/ready` goes red
-after a failed S3 write, which makes the app's `/ready` fail and takes it out of rotation.
+**Global view:** the gateway indexes every committed record in SQLite. On any replica, `/api/audit`
+queries that index, so you see every replica's records, filterable by `replica`. `/api/audit/verify`
+returns the latest archive verification plus a check of this replica's cache against the authoritative
+hashes.
 
-**Cost:** about 4 journal writes per API request (received, intent, outcome, completion). Measured locally
-under load, the journal adds **p95 ≈ 17 ms per record**. Journal objects are ~1 KB, so the Terraform
-lifecycle transitions only segments (>128 KB) to Glacier IR. Set `AUDIT_JOURNAL_URL=` (empty) to fall
-back to batched-only shipping.
+**What stays per replica:** the circuit breaker, proactive pacing buckets and token monitor. Divide
+`WA_MESSAGES_PER_SECOND` by the replica count if you need a hard global cap. The webhook-dedup and
+delivery-tracking stores are shared (a redelivery can land on any replica). That's SQLite on the shared
+volume locally; use Redis or Postgres across hosts.
 
-Alerts: `AuditJournalRefusingActions` (critical), `AuditOutcomeUnrecorded`, `AuditJournalSlow` (p95 >
-500 ms). Dashboard: journal latency, gateway write outcomes, refused and unrecorded actions.
+**Limits:** the gateway serialises commits, so throughput is roughly records-per-block ÷ S3 PUT latency;
+group commit keeps this high under load. One active gateway is the normal deployment. A second one is
+*safe* but slower (it pays conflict round trips), so run it as a standby rather than active-active. Without
+its index, a gateway recovers by reading blocks forward from S3, so keep its state volume.
 
-## Audit archive: S3 Object Lock (`app/audit_shipper.py`)
+## Audit archive & verification
 
-A separate **audit-shipper** container tails the audit log (mounted **read-only**) and uploads it as
-immutable segments. It holds the only S3 credentials, and they are write-only: it can add segments but
-can't list, delete or change retention. Compromising the app therefore doesn't expose the archive.
+The blocks under `<prefix>/blocks/` **are** the archive: locked (COMPLIANCE/GOVERNANCE), SHA-256
+checksummed, optionally SSE-KMS encrypted, with chain metadata (`first-seq`, `last-seq`, `first-prev-hash`,
+`last-hash`, `gateway`).
 
-```
-s3://<bucket>/audit/meta-api-tester/2026/09/29/000000000001-000000000036.jsonl
-  ObjectLockMode=COMPLIANCE  RetainUntilDate=+N days  SSE-KMS  x-amz-checksum-sha256
-  metadata: first-seq, last-seq, first-prev-hash, last-hash, sha256, source-host
-```
+The **verifier** (`make audit-verify-s3`, or `python -m app.audit_gateway verify --compare-local FILES`):
+- reads every object version, reading through delete markers and reporting them
+- checks each block's checksum and lock
+- flags block conflicts or gaps and rebuilds the chain from seq 1
+- reports records per replica and open intents
+- with `--compare-local`, checks each replica cache: a cached record whose hash differs, or that isn't in
+  the archive at all, means something was written on the host
 
-- Segments flush every `AUDIT_SHIP_FLUSH_SECONDS` (10s) or 500 records. The checkpoint (byte offset + last
-  seq/hash) advances only after S3 confirms the write, so restarts resume with no loss and no duplicates.
-- **Nothing forged is archived.** Every record must chain onto the last archived hash. A break halts
-  shipping.
-- **Rewrites are detected.** Every 60s, and at startup, the shipper checks that the local file still
-  contains the exact record it last archived. If someone truncates the file or rewrites history with a
-  fresh, internally valid chain (which *passes* the local `/api/audit/verify`), shipping halts with
-  `source_diverged` and 🚨 `AuditArchiveDiverged` goes to Slack. The shipper stays halted until a human
-  investigates. `make audit-verify-s3` then lists every local seq that differs from the archive.
-- The shipper audits its own actions (`audit.segment.shipped` with key/version/hash, `ship_failed`,
-  `shipping.halted`) as JSON lines on stdout.
+The gateway also runs it **every `AUDIT_VERIFY_INTERVAL_SECONDS`**, incrementally, since locked versions
+are immutable and are downloaded only once. Results are exported as metrics and at `GET :9102/verify/last`.
 
-**Verifier** (`make audit-verify-s3`, or `python -m app.audit_shipper verify [--compare-local FILE]`)
-reads **every object version**, checks each segment's SHA-256, confirms each has an unexpired lock, rebuilds
-the chain from seq 1, and reports gaps, conflicting duplicates and local mismatches. It also cross-checks
-the journal against the segments:
-- `journal_mismatches`: the same seq with a different hash
-- `journal_conflicts`: more than one version for a seq
-- `not_journaled`: records archived from the file that never passed through the gateway and aren't
-  explained by a `write_failed` marker, meaning something was written directly on the host
-- `open_intents`: durable intents older than 5 minutes with no outcome. This is a warning; it means the
-  action's result is unknown. It also reads
-through **delete markers**: a plain DELETE on a locked bucket is allowed but only hides the version. The
-locked record is still verified and the marker is reported as a delete attempt. Exit code 1 if anything is
-off.
-
-Alerts: `AuditArchiveDiverged` (critical), `AuditShipperDown` (critical), `AuditArchiveLagging` (>5 min
-unarchived), `AuditArchiveUploadFailures`. The Grafana dashboard shows written vs archived seq, lag, time
-since last upload, and chain integrity.
+Alerts: `AuditGatewayDown`, `AuditGatewayCommitFailures`, `AuditJournalRefusingActions` (critical);
+`AuditSequencerConflicts`, `AuditGatewayCommitSlow`, `AuditOutcomeUnrecorded`, `AuditArchiveVerifyFailed`
+/ `…Stale`, and `AuditOpenIntents`.
 
 **Local:** LocalStack enforces Object Lock (COMPLIANCE, 1 day), so version deletes and retention changes
-are refused. Its archive is **ephemeral**, lost when the container is recreated. Use
-`make audit-archive-reset-local` to wipe it together with the shipper checkpoint.
+are refused. It's **ephemeral**: `make audit-archive-reset-local` wipes it together with the gateway index.
 
 ### Production bucket (`infra/audit-bucket`, Terraform)
 
 ```bash
 cd infra/audit-bucket
-cp terraform.tfvars.example terraform.tfvars   # bucket name, shipper role, admins
+cp terraform.tfvars.example terraform.tfvars   # bucket name, gateway role, admins
 terraform init && terraform plan
 ```
 
@@ -333,12 +336,13 @@ It creates:
   `s3:BypassGovernanceRetention` (except optional break-glass principals), and denies
   lock/versioning/lifecycle/policy changes (except `admin_principal_arns`)
 - a Glacier IR transition after 90 days
-- least-privilege **shipper** (write-only) and **verifier** (read-only) IAM policies
+- least-privilege **gateway** (create/read blocks, list the prefix, no delete) and **verifier**
+  (read-only) IAM policies
 - a **CloudTrail data-event trail** on the bucket, so every read, write and delete attempt against the
   archive is itself recorded
 
-Then set the `shipper_env` output values in `.env` (with `AUDIT_S3_ENDPOINT_URL=` empty) and give the
-shipper the IAM role.
+Then set the `gateway_env` output values in `.env` (with `AUDIT_S3_ENDPOINT_URL=` empty) and give the
+gateway the IAM role.
 
 > ⚠️ `lock_mode` defaults to **GOVERNANCE** so you can validate first. **COMPLIANCE** can't be shortened
 > or removed by anyone, including the AWS root account, until retention expires. You'll pay to store every
@@ -347,12 +351,11 @@ shipper the IAM role.
 Trust boundary: the app is the author of records, so a fully compromised app can still write *false*
 records (it holds the journal token). It can't remove, reorder or rewrite anything already journaled, and
 it can't act without first leaving a durable intent.
-and periodically anchor the `head_hash` externally, since a local file can be replaced wholesale.
 
 ## Local dev
 
 ```bash
-make install && make test     # 64 tests (+6 live contract tests, opt-in), pytest + respx
+make install && make test     # 58 tests (+6 live contract tests, opt-in), pytest + respx
 make mock &                   # mock on :8081
 META_GRAPH_BASE_URL=http://localhost:8081 META_ACCESS_TOKEN=x make run
 ```

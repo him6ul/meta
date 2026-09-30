@@ -35,7 +35,7 @@ receivers:
             text: Silence
             url: '{{ template "slack.meta.silence" . }}'
     webhook_configs:
-      - url: http://app:8000/webhooks/alertmanager
+      - url: http://lb:8000/webhooks/alertmanager
         send_resolved: true
   - name: slack-critical
     slack_configs:
@@ -52,7 +52,7 @@ receivers:
             text: Silence
             url: '{{ template "slack.meta.silence" . }}'
     webhook_configs:
-      - url: http://app:8000/webhooks/alertmanager
+      - url: http://lb:8000/webhooks/alertmanager
         send_resolved: true
 
 inhibit_rules:

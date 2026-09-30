@@ -73,7 +73,7 @@ resource "aws_s3_bucket_lifecycle_configuration" "audit" {
   rule {
     id     = "archive"
     status = "Enabled"
-    # Segments only: journal records are ~1 KB and Glacier IR bills a 128 KB minimum per object.
+    # Large blocks only: Glacier IR bills a 128 KB minimum per object.
     filter {
       and {
         prefix                   = "${var.prefix}/"
@@ -179,30 +179,42 @@ resource "aws_s3_bucket_policy" "audit" {
 }
 
 # --- Least-privilege policies ---
-# Shipper: write new segments + read back its own head check. No delete, no list, no retention changes
-# beyond what PutObject sets (s3:PutObjectRetention is required to pass ObjectLock* headers on PutObject).
-data "aws_iam_policy_document" "shipper" {
+# Gateway (sequencer): create new blocks (conditional PutObject + retention), read blocks back to resolve
+# conflicts, and list the blocks prefix. ListBucket matters: without it S3 answers a missing key with 403
+# instead of 404, and the gateway could not tell "free slot" from "denied" when finding the head.
+# No delete, no retention changes beyond what PutObject sets.
+data "aws_iam_policy_document" "gateway" {
   statement {
-    sid       = "WriteSegments"
+    sid       = "WriteAndReadBlocks"
     actions   = ["s3:PutObject", "s3:PutObjectRetention", "s3:GetObject"]
     resources = [local.objects]
   }
   statement {
+    sid       = "ListBlocks"
+    actions   = ["s3:ListBucket", "s3:ListBucketVersions"]
+    resources = [aws_s3_bucket.audit.arn]
+    condition {
+      test     = "StringLike"
+      variable = "s3:prefix"
+      values   = ["${var.prefix}/*"]
+    }
+  }
+  statement {
     sid       = "Encrypt"
-    actions   = ["kms:GenerateDataKey", "kms:Encrypt"]
+    actions   = ["kms:GenerateDataKey", "kms:Encrypt", "kms:Decrypt"]
     resources = [aws_kms_key.audit.arn]
   }
 }
 
-resource "aws_iam_policy" "shipper" {
-  name   = "${var.bucket_name}-shipper"
-  policy = data.aws_iam_policy_document.shipper.json
+resource "aws_iam_policy" "gateway" {
+  name   = "${var.bucket_name}-gateway"
+  policy = data.aws_iam_policy_document.gateway.json
 }
 
-resource "aws_iam_role_policy_attachment" "shipper" {
-  for_each   = toset([for arn in var.shipper_principal_arns : element(split("/", arn), length(split("/", arn)) - 1) if strcontains(arn, ":role/")])
+resource "aws_iam_role_policy_attachment" "gateway" {
+  for_each   = toset([for arn in var.gateway_principal_arns : element(split("/", arn), length(split("/", arn)) - 1) if strcontains(arn, ":role/")])
   role       = each.value
-  policy_arn = aws_iam_policy.shipper.arn
+  policy_arn = aws_iam_policy.gateway.arn
 }
 
 # Verifier / auditors: read-only across all versions, incl. retention and delete markers.

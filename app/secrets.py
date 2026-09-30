@@ -28,7 +28,7 @@ SECRETS_ROTATIONS = Counter("secrets_rotations_total", "Secret fields whose valu
 
 APP_SECRET_FIELDS = {"meta_access_token", "meta_app_secret", "meta_webhook_verify_token", "app_api_keys",
                      "audit_journal_token"}
-SHIPPER_SECRET_FIELDS = {"audit_journal_token", "audit_journal_token_previous"}
+GATEWAY_SECRET_FIELDS = {"audit_journal_token", "audit_journal_token_previous"}
 
 
 class SecretsError(RuntimeError):

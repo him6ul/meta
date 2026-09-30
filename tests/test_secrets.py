@@ -6,7 +6,7 @@ import respx
 from fastapi.testclient import TestClient
 from moto import mock_aws
 
-from app.audit_shipper import ShipperSettings, create_gateway
+from app.audit_gateway import GatewaySettings, create_gateway
 from app.config import get_settings
 from app.main import create_app
 from app.secrets import APP_SECRET_FIELDS, SecretsError, SecretsLoader
@@ -59,16 +59,19 @@ def test_missing_secret_fails_loudly(sm):
 
 
 def test_gateway_accepts_previous_token_during_rotation(tmp_path):
+    import uuid
     with mock_aws():
         s3 = boto3.client("s3", region_name="us-east-1")
         s3.create_bucket(Bucket="rot", ObjectLockEnabledForBucket=True)
-        settings = ShipperSettings(audit_s3_bucket="rot", audit_journal_token="new",
-                                   audit_journal_token_previous="old", audit_s3_retention_days=1)
-        from app.audit import AuditLog
-        rec = AuditLog(str(tmp_path / "a.jsonl")).record("x")
-        rec2 = AuditLog(str(tmp_path / "a.jsonl")).record("y")
-        c = TestClient(create_gateway(settings, s3=s3))
-        assert c.post("/v1/journal", json=rec, headers={"authorization": "Bearer old"}).status_code == 201
-        assert c.post("/v1/journal", json=rec2, headers={"authorization": "Bearer new"}).status_code == 201
+        settings = GatewaySettings(audit_s3_bucket="rot", audit_journal_token="new", audit_journal_token_previous="old",
+                                   audit_s3_retention_days=1, audit_gateway_state_dir=str(tmp_path / "gw"))
+        app = create_gateway(settings, s3=s3)
+        c = TestClient(app)
+
+        def d():
+            return {"action": "x", "draft_id": uuid.uuid4().hex}
+        assert c.post("/v2/records", json=d(), headers={"authorization": "Bearer old"}).status_code == 201
+        assert c.post("/v2/records", json=d(), headers={"authorization": "Bearer new"}).status_code == 201
         settings.audit_journal_token_previous = ""                   # rotation finished
-        assert c.post("/v1/journal", json=rec, headers={"authorization": "Bearer old"}).status_code == 401
+        assert c.post("/v2/records", json=d(), headers={"authorization": "Bearer old"}).status_code == 401
+        app.state.sequencer.stop()

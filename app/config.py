@@ -27,9 +27,10 @@ class Settings(BaseSettings):
 
     # Audit trail. APP_API_KEYS="alice:key1,ci-bot:key2" enables API-key auth on /api/*; the key's
     # name becomes the audited actor. Unset = open access, actor taken from X-Actor (unverified).
-    audit_log_path: str = "data/audit.jsonl"
+    audit_log_path: str = "data/audit.jsonl"   # "{replica}" is replaced by the replica id
+    app_replica_id: str = ""                   # default: container hostname
     app_api_keys: str = ""
-    # Synchronous off-host journal (audit gateway in the audit-shipper sidecar). Unset = local-only.
+    # Audit gateway (global sequencer + S3 Object Lock). Unset = local single-writer mode (dev only).
     audit_journal_url: str = ""
     audit_journal_token: str = ""
     audit_journal_timeout_seconds: float = 2.0
@@ -73,6 +74,11 @@ class Settings(BaseSettings):
         """key -> actor name"""
         pairs = (p.split(":", 1) for p in self.app_api_keys.split(",") if ":" in p)
         return {key.strip(): name.strip() for name, key in pairs}
+
+    @property
+    def replica_id(self) -> str:
+        import socket
+        return self.app_replica_id or socket.gethostname()
 
     @property
     def graph_url(self) -> str:

@@ -82,8 +82,8 @@ jobs:
       - name: Audit archive verifies
         run: |
           sleep 20
-          docker compose exec -T audit-shipper python -m app.audit_shipper verify --compare-local /data/audit.jsonl > /tmp/verify.json
-          python -c "import json;r=json.load(open('/tmp/verify.json'));print(r['findings']);assert r['ok'],r['findings']"
+          docker compose exec -T audit-gateway sh -c 'python -m app.audit_gateway verify --compare-local /replicas/audit-*.jsonl' > /tmp/verify.json
+          python -c "import json;r=json.load(open('/tmp/verify.json'));print(r['findings'], r['records_by_replica']);assert r['ok'],r['findings'];assert len(r['records_by_replica'])>=2,'expected records from 2 replicas'"
       - name: All scrape targets up
         run: |
           curl -fsS 'localhost:9090/api/v1/query?query=up' | python -c "import json,sys;r=json.load(sys.stdin)['data']['result'];down=[x['metric']['job'] for x in r if x['value'][1]!='1'];print('down:',down);assert not down"
