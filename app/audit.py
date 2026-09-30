@@ -112,6 +112,10 @@ class JournalClient:
             attempt += 1
         raise AuditUnavailable(f"journal write failed for seq {entry.get('seq')}: {last_error}")
 
+    def set_token(self, token: str) -> None:
+        """Called on secret rotation."""
+        self._http.headers["authorization"] = f"Bearer {token}"
+
     async def healthy(self) -> bool:
         """Gateway /ready: up AND able to write to S3 recently."""
         try:

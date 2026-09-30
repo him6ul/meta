@@ -19,6 +19,7 @@ from opentelemetry import trace
 
 from app.audit import AuditLog, AuditUnavailable, digest, sanitize
 from app.config import Settings
+from app.rate_limiter import LocalRateLimited, MetaRateLimiter
 from app.metrics import (
     META_ATTEMPTS,
     META_CIRCUIT_REJECTIONS,
@@ -173,6 +174,7 @@ class MetaGraphClient:
         self.settings = settings
         self.audit = audit
         self._circuit_events: list[tuple[int, int, int]] = []
+        self.limiter = MetaRateLimiter(settings) if settings.meta_rate_limiting_enabled else None
         self.breaker = CircuitBreaker(settings.meta_circuit_failure_threshold,
                                       settings.meta_circuit_reset_seconds,
                                       on_change=self._audit_circuit)
@@ -283,6 +285,16 @@ class MetaGraphClient:
 
         with tracer.start_as_current_span(f"meta {method} {endpoint}") as span:
             span.set_attribute("meta.endpoint", endpoint)
+            if self.limiter:
+                try:
+                    waited = await self.limiter.before_call(method, path, json_body)
+                    if waited:
+                        span.set_attribute("meta.rate_limit_wait_s", round(waited, 3))
+                except LocalRateLimited as exc:
+                    META_REQUESTS.labels(endpoint, method, "none", "local_rate_limited").inc()
+                    span.set_attribute("meta.outcome", "local_rate_limited")
+                    await audit("local_rate_limited", 0, "none", error=str(exc))
+                    raise
             try:
                 self.breaker.before_call()
             except CircuitOpenError:
@@ -319,7 +331,10 @@ class MetaGraphClient:
                 last_status = status
                 META_LATENCY.labels(endpoint, method).observe(elapsed)
                 META_ATTEMPTS.labels(endpoint, method, status).inc()
-                self.last_usage = record_rate_limit_headers(resp.headers) or self.last_usage
+                parsed_usage = record_rate_limit_headers(resp.headers)
+                self.last_usage = parsed_usage or self.last_usage
+                if self.limiter and parsed_usage:
+                    self.limiter.observe(parsed_usage)
                 span.set_attribute("http.status_code", resp.status_code)
                 span.set_attribute("meta.attempt", attempt)
 

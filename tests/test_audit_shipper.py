@@ -148,3 +148,29 @@ def test_verify_reads_through_delete_markers_and_flags_them(env):
     assert report["head_seq"] == 3 and report["gaps"] == []   # locked version still read and verified
     assert [m["key"] for m in report["delete_markers"]] == [key]
     assert report["ok"] is False                                # but the attempt is reported
+
+
+def test_scheduled_verifier_is_incremental_and_exports_metrics(env):
+    from prometheus_client import REGISTRY
+
+    from app.audit_shipper import ScheduledVerifier
+    settings, s3, log = env
+    for i in range(6):
+        log.record("x", n=i)
+    drain(Shipper(settings, s3=s3))
+    v = ScheduledVerifier(settings, s3=s3)
+    first = v.run_once()
+    assert first["ok"] and first["fetched"] == 2
+    assert REGISTRY.get_sample_value("audit_archive_verify_ok") == 1
+
+    log.record("y")
+    drain(Shipper(settings, s3=s3))
+    second = v.run_once()
+    assert second["ok"] and second["fetched"] == 1 and second["head_seq"] == 7   # only the new segment
+
+    key = s3.list_objects_v2(Bucket=BUCKET)["Contents"][0]["Key"]
+    s3.delete_object(Bucket=BUCKET, Key=key)   # delete marker appears -> next run fails
+    third = v.run_once()
+    assert not third["ok"] and third["fetched"] == 0
+    assert REGISTRY.get_sample_value("audit_archive_verify_ok") == 0
+    assert REGISTRY.get_sample_value("audit_archive_verify_findings", {"check": "delete_markers"}) == 1

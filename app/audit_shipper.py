@@ -84,12 +84,18 @@ class ShipperSettings(BaseSettings):
     audit_s3_retention_days: int = 365
     audit_s3_journal_retention_days: int | None = None  # defaults to audit_s3_retention_days
     audit_journal_token: str = ""            # bearer token the app must present to the gateway
+    audit_journal_token_previous: str = ""   # also accepted during a rotation
+    secrets_manager_secret_id: str = ""
+    secrets_manager_region: str = "us-east-1"
+    secrets_manager_endpoint_url: str = ""
+    secrets_refresh_seconds: float = 300
     audit_journal_put_timeout_seconds: float = 1.5  # hard deadline; keep below the app's journal budget
     audit_s3_kms_key_id: str = ""            # SSE-KMS key; empty = bucket default encryption
     audit_ship_batch_max_records: int = 500
     audit_ship_flush_seconds: float = 10.0
     audit_ship_poll_seconds: float = 1.0
     audit_ship_metrics_port: int = 9102
+    audit_verify_interval_seconds: float = 900   # scheduled archive verification (0 = off)
 
 
 @dataclass
@@ -301,14 +307,47 @@ class Shipper:
 
 
 # ---------- verification ----------
-def verify_archive(settings: ShipperSettings, s3=None, compare_local: str | None = None) -> dict[str, Any]:
+_LINK_FIELDS = ("intent_seq", "received_seq", "failed_seq")
+
+
+def _slim(rec: dict[str, Any]) -> dict[str, Any]:
+    """Everything the checks need after the record's own hash has been verified once."""
+    details = rec.get("details") or {}
+    return {"seq": rec["seq"], "hash": rec.get("hash"), "prev_hash": rec.get("prev_hash"),
+            "self_ok": link_ok(rec.get("prev_hash"), rec), "action": rec.get("action", ""),
+            "ts": rec.get("ts"), "resource": rec.get("resource"),
+            "details": {k: details[k] for k in _LINK_FIELDS if k in details}}
+
+
+def _load_version(s3, bucket: str, key: str, version_id: str) -> dict[str, Any]:
+    got = s3.get_object(Bucket=bucket, Key=key, VersionId=version_id)
+    body = got["Body"].read()
+    lines = [body] if "/journal/" in key else [x for x in body.splitlines() if x.strip()]
+    return {"key": key, "journal": "/journal/" in key,
+            "sha_ok": got.get("Metadata", {}).get("sha256") == hashlib.sha256(body).hexdigest(),
+            # GetObject returns the lock headers when the caller has s3:GetObjectRetention.
+            "lock_mode": got.get("ObjectLockMode"), "until": got.get("ObjectLockRetainUntilDate"),
+            "records": [_slim(json.loads(x)) for x in lines]}
+
+
+def verify_archive(settings: ShipperSettings, s3=None, compare_local: str | None = None,
+                   cache: dict[str, dict] | None = None) -> dict[str, Any]:
+    """Full logical check of the archive.
+
+    `cache` (version_id -> parsed object) makes repeated runs incremental: Object Lock versions are
+    immutable, so a version already downloaded and hash-checked never needs fetching again. Only the
+    listing is repeated, which also surfaces new versions and delete markers.
+    """
     s3 = s3 or make_s3(settings)
+    cache = cache if cache is not None else {}
     bucket, prefix = settings.audit_s3_bucket, settings.audit_s3_prefix.strip("/") + "/"
     by_seq: dict[int, dict] = {}
     journal: dict[int, dict] = {}
-    report: dict[str, Any] = {"bucket": bucket, "prefix": prefix, "objects": 0, "conflicts": [],
+    report: dict[str, Any] = {"bucket": bucket, "prefix": prefix, "objects": 0, "fetched": 0, "conflicts": [],
                               "unlocked_objects": [], "checksum_mismatches": [], "delete_markers": [],
                               "journal_conflicts": [], "journal_invalid": [], "warnings": []}
+    now = datetime.now(timezone.utc)
+    live_versions: set[str] = set()
 
     # Walk every version, not just current objects: a plain DELETE on a locked bucket is allowed but only
     # adds a delete marker that hides the (still locked) version. Read through it and report the marker.
@@ -317,33 +356,33 @@ def verify_archive(settings: ShipperSettings, s3=None, compare_local: str | None
             report["delete_markers"].append({"key": marker["Key"], "version_id": marker.get("VersionId"),
                                              "at": marker.get("LastModified")})
         for obj in page.get("Versions", []):
-            key = obj["Key"]
+            key, vid = obj["Key"], obj["VersionId"]
+            live_versions.add(vid)
             report["objects"] += 1
-            got = s3.get_object(Bucket=bucket, Key=key, VersionId=obj["VersionId"])
-            body = got["Body"].read()
-            if got.get("Metadata", {}).get("sha256") != hashlib.sha256(body).hexdigest():
+            entry = cache.get(vid)
+            if entry is None:
+                entry = cache[vid] = _load_version(s3, bucket, key, vid)
+                report["fetched"] += 1
+            if not entry["sha_ok"]:
                 report["checksum_mismatches"].append(key)
-            # GetObject returns the lock headers when the caller has s3:GetObjectRetention.
-            until = got.get("ObjectLockRetainUntilDate")
-            if not got.get("ObjectLockMode") or until is None:
+            if not entry["lock_mode"] or entry["until"] is None:
                 report["unlocked_objects"].append({"key": key, "reason": "no retention"})
-            elif until <= datetime.now(timezone.utc):
+            elif entry["until"] <= now:
                 report["unlocked_objects"].append({"key": key, "reason": "retention expired"})
-            if "/journal/" in key:
-                rec = json.loads(body)
-                if not link_ok(rec.get("prev_hash"), rec):
+            if entry["journal"]:
+                rec = entry["records"][0]
+                if not rec["self_ok"]:
                     report["journal_invalid"].append(key)
                 elif rec["seq"] in journal and journal[rec["seq"]]["hash"] != rec["hash"]:
                     report["journal_conflicts"].append({"seq": rec["seq"], "key": key})
                 journal.setdefault(rec["seq"], rec)
                 continue
-            for line in body.splitlines():
-                if not line.strip():
-                    continue
-                rec = json.loads(line)
+            for rec in entry["records"]:
                 if rec["seq"] in by_seq and by_seq[rec["seq"]]["hash"] != rec["hash"]:
                     report["conflicts"].append({"seq": rec["seq"], "key": key})
                 by_seq.setdefault(rec["seq"], rec)
+    for vid in set(cache) - live_versions:   # versions that vanished from the listing
+        report["warnings"].append(f"previously verified version disappeared: {cache[vid]['key']} ({vid})")
 
     prev, gaps, first_bad = GENESIS_HASH, [], None
     head = max(by_seq, default=0)
@@ -353,7 +392,7 @@ def verify_archive(settings: ShipperSettings, s3=None, compare_local: str | None
             gaps.append(seq)
             first_bad = first_bad or seq
             break
-        if not link_ok(prev, rec):
+        if not rec["self_ok"] or rec["prev_hash"] != prev:
             first_bad = first_bad or seq
             break
         prev = rec["hash"]
@@ -383,17 +422,19 @@ def verify_archive(settings: ShipperSettings, s3=None, compare_local: str | None
     done = {r["details"].get(k) for r in combined.values() for k in ("intent_seq", "received_seq")}
     failed = {r["details"].get("failed_seq") for r in combined.values()
               if r["action"] == "audit.journal.write_failed"}
-    cutoff = datetime.now(timezone.utc) - timedelta(minutes=5)
+    cutoff = now - timedelta(minutes=5)
     open_intents = [{"seq": q, "action": r["action"], "resource": r.get("resource"), "ts": r["ts"]}
                     for q, r in sorted(combined.items())
                     if (r["action"].endswith(".intent") or r["action"] == "http.request.received")
                     and q not in done and q not in failed and datetime.fromisoformat(r["ts"]) < cutoff]
     report["open_intents"] = open_intents[:50]
+    report["open_intent_count"] = len(open_intents)
     if open_intents:
         report["warnings"].append(f"{len(open_intents)} durable intents have no recorded outcome")
 
     if compare_local:
         mismatches, local_head = [], 0
+        archived_head = max(head, max(journal, default=0))
         with open(compare_local, encoding="utf-8") as f:
             for line in f:
                 if not line.strip():
@@ -403,15 +444,68 @@ def verify_archive(settings: ShipperSettings, s3=None, compare_local: str | None
                 archived = by_seq.get(rec["seq"]) or journal.get(rec["seq"])
                 if archived is not None and archived["hash"] != rec["hash"]:
                     mismatches.append(rec["seq"])
-        report["local"] = {"head_seq": local_head, "unshipped": max(0, local_head - max(head, max(journal, default=0))),
+        report["local"] = {"head_seq": local_head, "unshipped": max(0, local_head - archived_head),
                            "mismatched_seqs": mismatches[:20], "mismatch_count": len(mismatches),
-                           "missing_locally": max(0, max(head, max(journal, default=0)) - local_head)}
+                           "missing_locally": max(0, archived_head - local_head)}
 
-    report["ok"] = not (report["conflicts"] or report["unlocked_objects"] or report["checksum_mismatches"]
-                        or report["delete_markers"] or first_bad or report["journal_conflicts"]
-                        or report["journal_invalid"] or report["journal_mismatches"] or report["not_journaled"] or (compare_local and (report["local"]["mismatch_count"]
-                                                            or report["local"]["missing_locally"])))
+    report["findings"] = {
+        "conflicts": len(report["conflicts"]), "unlocked_objects": len(report["unlocked_objects"]),
+        "checksum_mismatches": len(report["checksum_mismatches"]), "delete_markers": len(report["delete_markers"]),
+        "chain_break": int(bool(first_bad)), "journal_conflicts": len(report["journal_conflicts"]),
+        "journal_invalid": len(report["journal_invalid"]), "journal_mismatches": len(report["journal_mismatches"]),
+        "not_journaled": len(report["not_journaled"]),
+        "local_mismatches": report["local"]["mismatch_count"] if compare_local else 0,
+        "missing_locally": report["local"]["missing_locally"] if compare_local else 0,
+    }
+    report["ok"] = not any(report["findings"].values())
     return report
+
+
+VERIFY_OK = Gauge("audit_archive_verify_ok", "1 if the last scheduled archive verification passed")
+VERIFY_LAST_RUN = Gauge("audit_archive_verify_last_run_timestamp_seconds", "Last completed verification")
+VERIFY_DURATION = Gauge("audit_archive_verify_duration_seconds", "Duration of the last verification")
+VERIFY_FINDINGS = Gauge("audit_archive_verify_findings", "Findings from the last verification", ["check"])
+VERIFY_OPEN_INTENTS = Gauge("audit_archive_open_intents", "Durable intents >5 min old with no outcome")
+VERIFY_FETCHED = Counter("audit_archive_verify_objects_fetched_total", "Object versions downloaded by the verifier")
+VERIFY_ERRORS = Counter("audit_archive_verify_errors_total", "Verification runs that errored")
+
+
+class ScheduledVerifier:
+    """Runs verify_archive every N seconds in the sidecar and exports the result as metrics."""
+
+    def __init__(self, settings: ShipperSettings, s3=None):
+        self.s = settings
+        self.s3 = s3 or make_s3(settings)
+        self.cache: dict[str, dict] = {}
+        self.last_report: dict[str, Any] | None = None
+
+    def run_once(self) -> dict[str, Any]:
+        start = time.monotonic()
+        compare = self.s.audit_log_path if Path(self.s.audit_log_path).exists() else None
+        report = verify_archive(self.s, s3=self.s3, compare_local=compare, cache=self.cache)
+        VERIFY_DURATION.set(time.monotonic() - start)
+        VERIFY_LAST_RUN.set(time.time())
+        VERIFY_OK.set(1 if report["ok"] else 0)
+        VERIFY_FETCHED.inc(report["fetched"])
+        VERIFY_OPEN_INTENTS.set(report["open_intent_count"])
+        for check, n in report["findings"].items():
+            VERIFY_FINDINGS.labels(check).set(n)
+        audit_event("audit.archive.verified", ok=report["ok"], head_seq=report["head_seq"],
+                    objects=report["objects"], fetched=report["fetched"],
+                    findings={k: v for k, v in report["findings"].items() if v},
+                    open_intents=report["open_intent_count"])
+        self.last_report = report
+        return report
+
+    def run_forever(self) -> None:
+        time.sleep(min(60, self.s.audit_verify_interval_seconds))   # let the stack settle first
+        while True:
+            try:
+                self.run_once()
+            except Exception:
+                VERIFY_ERRORS.inc()
+                log.exception("scheduled verification failed")
+            time.sleep(self.s.audit_verify_interval_seconds)
 
 
 # ---------- synchronous journal gateway ----------
@@ -419,7 +513,8 @@ def journal_key(settings: ShipperSettings, seq: int) -> str:
     return f"{settings.audit_s3_prefix.strip('/')}/journal/{seq:012d}.json"
 
 
-def create_gateway(settings: ShipperSettings, s3=None, shipper: "Shipper | None" = None) -> FastAPI:
+def create_gateway(settings: ShipperSettings, s3=None, shipper: "Shipper | None" = None,
+                   verifier: "ScheduledVerifier | None" = None) -> FastAPI:
     s3 = s3 or make_s3(settings)
     retention_days = settings.audit_s3_journal_retention_days or settings.audit_s3_retention_days
     app = FastAPI(title="Audit gateway", docs_url=None, redoc_url=None)
@@ -441,6 +536,13 @@ def create_gateway(settings: ShipperSettings, s3=None, shipper: "Shipper | None"
         """Liveness only."""
         return {"status": "ok", "shipper_halted": bool(shipper and shipper.halt_reason)}
 
+    @app.get("/verify/last")
+    def last_verification():
+        """Most recent scheduled verification report."""
+        if verifier is None or verifier.last_report is None:
+            raise HTTPException(status_code=404, detail="no verification has run yet")
+        return JSONResponse(content=json.loads(json.dumps(verifier.last_report, default=str)))
+
     @app.get("/ready")
     def ready():
         """Not ready while the most recent S3 write failed (within 30s): the app then reports not-ready
@@ -453,8 +555,10 @@ def create_gateway(settings: ShipperSettings, s3=None, shipper: "Shipper | None"
     # Sync def: FastAPI runs it in a threadpool, so blocking boto3 calls don't stall other writes.
     @app.post("/v1/journal", status_code=201)
     def put_journal(record: dict = Body(...), authorization: str = Header("")):
-        token = settings.audit_journal_token
-        if not token or not hmac.compare_digest(authorization, f"Bearer {token}"):
+        accepted = [t for t in (settings.audit_journal_token, settings.audit_journal_token_previous) if t]
+        # Compare against every accepted token (no short-circuit) to keep timing uniform.
+        matches = [hmac.compare_digest(authorization, f"Bearer {t}") for t in accepted]
+        if not any(matches):
             reject(401, "unauthorized")
         seq = record.get("seq")
         if not isinstance(seq, int) or seq < 1 or not isinstance(record.get("action"), str):
@@ -523,11 +627,36 @@ def main(argv: list[str] | None = None) -> int:
     if not settings.audit_s3_bucket:
         print("AUDIT_S3_BUCKET is required", file=sys.stderr)
         return 2
+    if settings.secrets_manager_secret_id:
+        from app.secrets import SHIPPER_SECRET_FIELDS, SecretsError, SecretsLoader
+        loader = SecretsLoader(settings, settings.secrets_manager_secret_id, SHIPPER_SECRET_FIELDS,
+                               region=settings.secrets_manager_region,
+                               endpoint_url=settings.secrets_manager_endpoint_url,
+                               # stdout carries the JSON report in `verify` mode, so audit lines go to stderr there
+                               on_change=lambda changed: audit_event(
+                                   "secrets.rotated", stream=None if args.cmd == "run" else sys.stderr,
+                                   fields=sorted(changed), fingerprints=changed))
+        loader.load()
+
+        def refresh_forever():
+            while True:
+                time.sleep(settings.secrets_refresh_seconds)
+                try:
+                    loader.load()
+                except SecretsError as exc:
+                    log.error("secrets refresh failed: %s", exc)
+
+        if args.cmd == "run" and settings.secrets_refresh_seconds > 0:
+            threading.Thread(target=refresh_forever, name="secrets-refresh", daemon=True).start()
     if args.cmd == "run":
         s3 = make_s3(settings)
         shipper = Shipper(settings, s3=s3)
         threading.Thread(target=shipper.run_forever, name="segment-shipper", daemon=True).start()
-        uvicorn.run(create_gateway(settings, s3=s3, shipper=shipper), host="0.0.0.0",
+        verifier = None
+        if settings.audit_verify_interval_seconds > 0:
+            verifier = ScheduledVerifier(settings, s3=s3)
+            threading.Thread(target=verifier.run_forever, name="archive-verifier", daemon=True).start()
+        uvicorn.run(create_gateway(settings, s3=s3, shipper=shipper, verifier=verifier), host="0.0.0.0",
                     port=settings.audit_ship_metrics_port, log_level="warning")
         return 0
     report = verify_archive(settings, compare_local=args.compare_local)

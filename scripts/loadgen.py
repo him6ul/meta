@@ -27,6 +27,8 @@ async def main(base: str, rps: float, duration: float) -> None:
     async with httpx.AsyncClient(base_url=base, timeout=60) as client:
         async def one():
             _, method, path, body = random.choices(CALLS, weights)[0]
+            if body and "to" in body:   # spread recipients, like real traffic (pair rate limit is per user)
+                body = {**body, "to": f"1555{random.randint(0, 999999):06d}"}
             try:
                 r = await client.request(method, path, json=body)
                 stats[r.status_code] = stats.get(r.status_code, 0) + 1

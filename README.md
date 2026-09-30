@@ -33,6 +33,7 @@ docker compose up -d --build
 | Fake Slack inbox (when no real webhook set) | http://localhost:8081/_mock/slack |
 | LocalStack S3 (Object Lock archive) | http://localhost:4566 (`make audit-archive-ls`) |
 | Jaeger traces (service `meta-api-tester`) | http://localhost:16686 |
+| Logs (Grafana → Explore → Loki) | http://localhost:3000/explore |
 | Mock Meta control | http://localhost:8081/docs |
 
 Generate traffic and break things:
@@ -75,7 +76,10 @@ For webhooks, expose `/webhooks/meta` publicly (e.g. `ngrok http 8000`), then se
 | POST | `/api/whatsapp/templates` | `POST /{phone-id}/messages` (template) |
 | GET/POST | `/api/pages/posts` | `GET /{page-id}/posts`, `POST /{page-id}/feed` |
 | GET | `/api/instagram/media` | `GET /{ig-id}/media` |
-| GET | `/api/rate-limits` | last usage headers + circuit state |
+| GET | `/api/rate-limits` | last usage headers, circuit state, proactive pacing state |
+| GET | `/api/token-status?refresh=` | token validity, expiry, missing scopes (from `/debug_token`) |
+| GET | `/api/whatsapp/messages/{wamid}/status` | delivery state of one message |
+| GET | `/api/whatsapp/delivery-stats?window_seconds=` | delivery/failure rate, top failure reasons, stuck count |
 | GET/POST | `/webhooks/meta` | verification handshake / event delivery |
 | GET | `/webhooks/meta/recent` | last 50 received webhook payloads |
 | GET | `/api/audit?action=&actor=&request_id=&outcome=&limit=` | query the audit trail (newest first) |
@@ -84,7 +88,79 @@ For webhooks, expose `/webhooks/meta` publicly (e.g. `ngrok http 8000`), then se
 | GET | `/health`, `/ready`, `/metrics` | ops |
 
 Meta errors come back with Meta's own error body. Throttling maps to **429**, Meta 5xx to **502**,
-an open circuit to **503** and an unreachable upstream to **504**.
+an open circuit to **503** and an unreachable upstream to **504**. A call refused by local pacing gets
+**429** with `Retry-After` and `"source": "local"`; it never reaches Meta.
+
+## Production hardening
+
+**Token health** (`app/token_monitor.py`) calls `/debug_token` every `META_TOKEN_CHECK_INTERVAL_SECONDS`
+(1h), inspecting with the app token when app ID and secret are set. It exports validity, expiry,
+data-access expiry and missing `META_REQUIRED_SCOPES`. Alerts fire at 7 days and 1 day before expiry, and
+when the token is invalid, scopes are missing, or the check itself goes stale.
+`meta_token_valid` starts as NaN, so no alert fires before the first check.
+
+**Webhooks** (`app/webhook_dedup.py`)
+- **Signatures are required.** Without `META_APP_SECRET`, deliveries are rejected with 503, so Meta
+  retries until you fix it, and `/ready` fails. `META_WEBHOOK_REQUIRE_SIGNATURE=false` opts out
+  explicitly.
+- **Effectively-once processing.** Meta delivers at least once, so events are deduplicated *per event*:
+  `msg:<wamid>`, `status:<wamid>:<status>`, `mid:<mid>`, or a content hash. The keys live in SQLite on the
+  persistent volume (7-day TTL). An event is marked only after it has been durably recorded and processed,
+  so a failed attempt stays eligible for redelivery. A redelivered batch processes only its new events.
+
+**WhatsApp delivery tracking** (`app/delivery_tracker.py`) registers each accepted `wamid` and advances it
+through status webhooks (`sent → delivered → read`, or `failed`). A status never moves a message backwards.
+You get time-to-sent/delivered/read histograms, failures by Meta error code, a count of messages stuck
+undelivered past 10 minutes, per-message status, and window stats. Failures are also recorded in the audit
+log as `whatsapp.message.failed`.
+
+**Proactive rate limiting** (`app/rate_limiter.py`) paces calls from Meta's own usage headers:
+- Calls are delayed proportionally between `META_RATE_SOFT_PCT` (80) and `META_RATE_HARD_PCT` (95), and
+  refused locally at the hard limit or while Meta reports `estimated_time_to_regain_access`.
+- App-wide usage applies to every call. Business-use-case usage applies only to its product (a WhatsApp
+  throttle doesn't block `/debug_token` or Pages).
+- WhatsApp has a token bucket per phone number (80 msg/s) and per recipient (pair limit).
+- Stale readings expire, so an old high reading can't lock the app out.
+- Local refusals are audited (`outcome: local_rate_limited`).
+
+**Scheduled archive verification** runs in the sidecar every `AUDIT_VERIFY_INTERVAL_SECONDS` (15 min;
+5 min in compose). It's incremental: locked versions are immutable, so each version is downloaded and
+checked only once, and later runs just re-list (new versions, delete markers, vanished versions). Results go
+to `audit_archive_verify_*` metrics, `GET :9102/verify/last` (`make verify-last`), and alerts
+(`AuditArchiveVerifyFailed`, `…Stale`, `AuditOpenIntents`).
+
+**Secrets** (`app/secrets.py`, `infra/app-secrets`): set `SECRETS_MANAGER_SECRET_ID` to load
+`META_ACCESS_TOKEN`, `META_APP_SECRET`, `APP_API_KEYS`, `AUDIT_JOURNAL_TOKEN`, and so on from AWS Secrets
+Manager. They're refreshed every `SECRETS_REFRESH_SECONDS` and applied in place without a restart. The app
+and the gateway use separate secrets with separate read policies. Rotations are audited as field names plus
+fingerprints; values never appear anywhere.
+
+To rotate the journal token with zero downtime:
+1. Set the gateway secret to the new token and `AUDIT_JOURNAL_TOKEN_PREVIOUS` to the old one.
+2. Wait one refresh interval, then give the app the new token.
+3. Wait another interval, then clear `_PREVIOUS`.
+
+This was tested live with continuous traffic and produced no errors. Locally, LocalStack pre-creates both
+secrets; enable them with `APP_SECRETS_MANAGER_SECRET_ID=meta-api-tester/app` and
+`GATEWAY_SECRETS_MANAGER_SECRET_ID=meta-api-tester/audit-gateway`.
+
+**Logs** go to Loki via Grafana Alloy (all compose services). JSON fields become `level`/`logger` labels,
+and `trace_id` becomes structured metadata. Log lines link to the Jaeger trace and traces link back to
+their logs. The dashboard has "Errors & warnings" and "Audit stream" log panels.
+
+**CI** (`.github/workflows/ci.yml`):
+- `test`: the unit suite.
+- `config`: promtool (rules and config), amtool, compose, and Terraform fmt/validate for every
+  `infra/*` module.
+- `smoke`: the full stack on a runner, with load, a signed duplicate webhook, fail-closed with S3 paused,
+  archive verification and all scrape targets up.
+- `contract`: the live Meta tests, daily and on manual dispatch, reading secrets from a `meta-sandbox`
+  environment.
+
+**Contract tests** (`tests/contract`, `make contract`) run against the real Graph API and are skipped
+unless `META_LIVE_ACCESS_TOKEN` is set. They check `/me`, token validity, scopes and expiry, Meta's error
+shape (what `MetaAPIError` parses), usage-header parsing, and a readable WhatsApp phone number. Sending a
+real `hello_world` template additionally needs `META_LIVE_WA_TO`.
 
 ## Resilience (`app/graph_client.py`)
 
@@ -276,7 +352,7 @@ and periodically anchor the `head_hash` externally, since a local file can be re
 ## Local dev
 
 ```bash
-make install && make test     # 39 tests, pytest + respx
+make install && make test     # 64 tests (+6 live contract tests, opt-in), pytest + respx
 make mock &                   # mock on :8081
 META_GRAPH_BASE_URL=http://localhost:8081 META_ACCESS_TOKEN=x make run
 ```

@@ -1,6 +1,7 @@
 """Meta webhook endpoint: subscription verification (GET) and signed event delivery (POST)."""
 import hashlib
 import hmac
+import json
 import logging
 from collections import deque
 
@@ -9,7 +10,9 @@ from fastapi.responses import PlainTextResponse
 
 from app.audit import AuditUnavailable, digest
 from app.config import get_settings
-from app.metrics import ALERT_NOTIFICATIONS, AUDIT_REFUSED, WEBHOOK_EVENTS, WEBHOOK_VERIFICATIONS
+from app.metrics import (ALERT_NOTIFICATIONS, AUDIT_REFUSED, WEBHOOK_DUPLICATES, WEBHOOK_EVENTS,
+                         WEBHOOK_REJECTED, WEBHOOK_VERIFICATIONS)
+from app.webhook_dedup import event_keys
 
 log = logging.getLogger("meta.webhooks")
 router = APIRouter(prefix="/webhooks", tags=["webhooks"])
@@ -65,9 +68,20 @@ async def receive(request: Request):
     else:
         sig_state = "unchecked"
 
+    if sig_state == "unchecked" and settings.meta_webhook_require_signature:
+        # Misconfiguration, not a bad sender: 503 so Meta keeps retrying until META_APP_SECRET is set,
+        # instead of us accepting unauthenticated events.
+        WEBHOOK_REJECTED.labels("signature_missing_secret").inc()
+        log.error("webhook rejected: META_APP_SECRET not configured but signatures are required")
+        await durable(request, "webhook.meta.received", outcome="denied", actor="unknown",
+                      resource="/webhooks/meta", signature=sig_state, body=digest(body),
+                      reason="META_APP_SECRET not configured")
+        raise HTTPException(status_code=503, detail="webhook signature verification not configured")
+
     try:
-        payload = await request.json()
+        payload = json.loads(body)
     except ValueError:
+        WEBHOOK_REJECTED.labels("invalid_json").inc()
         WEBHOOK_EVENTS.labels("unknown", "unknown", sig_state).inc()
         await durable(request, "webhook.meta.received", outcome="failure", actor="unknown",
                       resource="/webhooks/meta", signature=sig_state, body=digest(body), reason="invalid JSON")
@@ -75,6 +89,7 @@ async def receive(request: Request):
 
     obj = payload.get("object", "unknown")
     if sig_state == "invalid":
+        WEBHOOK_REJECTED.labels("signature_invalid").inc()
         WEBHOOK_EVENTS.labels(obj, "n/a", sig_state).inc()
         log.warning("webhook signature invalid", extra={"object": obj})
         await durable(request, "webhook.meta.received", outcome="denied", actor="unknown",
@@ -82,27 +97,43 @@ async def receive(request: Request):
                       reason="X-Hub-Signature-256 mismatch")
         raise HTTPException(status_code=401, detail="invalid signature")
 
-    all_fields: list[str] = []
-    for entry in payload.get("entry", []):
-        # WhatsApp/Pages/Instagram use "changes"; Messenger uses "messaging".
-        fields = [c.get("field", "unknown") for c in entry.get("changes", [])]
-        if entry.get("messaging"):
-            fields.append("messaging")
-        for field in fields or ["unknown"]:
-            WEBHOOK_EVENTS.labels(obj, field, sig_state).inc()
-        all_fields += fields
+    events = event_keys(payload)
+    dedup = request.app.state.webhook_dedup
+    already = dedup.seen([e["key"] for e in events])
+    new = [e for e in events if e["key"] not in already]
+    for e in events:
+        WEBHOOK_EVENTS.labels(obj, e["field"], sig_state).inc()
+    for e in events:
+        if e["key"] in already:
+            WEBHOOK_DUPLICATES.labels(obj, e["kind"]).inc()
+
     # Acknowledge (200) only once the delivery is durably recorded; otherwise Meta retries.
     await durable(request, "webhook.meta.received",
                   actor="meta" if sig_state == "valid" else "unverified:meta",
-                  resource="/webhooks/meta", object=obj, fields=sorted(set(all_fields)) or None,
+                  resource="/webhooks/meta", object=obj,
+                  fields=sorted({e["field"] for e in events}) or None,
                   entry_ids=[e.get("id") for e in payload.get("entry", [])], signature=sig_state,
-                  body=digest(body))
+                  events=len(events), new_event_keys=[e["key"] for e in new][:50] or None,
+                  duplicate_event_keys=sorted(already)[:50] or None, body=digest(body))
 
-    RECENT_EVENTS.appendleft({"signature": sig_state, "payload": payload})
-    log.info("webhook received", extra={"object": obj, "entries": len(payload.get("entry", [])),
-                                        "signature": sig_state})
-    # Meta expects a fast 200; do heavy processing asynchronously in a real system.
-    return {"status": "received"}
+    if new:
+        # Process only events not seen before, then mark them. If processing raises, nothing is
+        # marked and the 500 makes Meta redeliver.
+        await process_events(request, payload, new)
+        dedup.mark([e["key"] for e in new])
+
+    RECENT_EVENTS.appendleft({"signature": sig_state, "new_events": [e["key"] for e in new],
+                              "duplicates": sorted(already), "payload": payload})
+    log.info("webhook received", extra={"object": obj, "events": len(events), "new": len(new),
+                                        "duplicates": len(already), "signature": sig_state})
+    return {"status": "received", "events": len(events), "new": len(new), "duplicates": len(already)}
+
+
+async def process_events(request: Request, payload: dict, events: list[dict]) -> None:
+    """Business handling for first-time events. Extend here; keep it idempotent where possible."""
+    tracker = getattr(request.app.state, "delivery_tracker", None)
+    if tracker is not None:
+        await tracker.on_webhook(payload, {e["key"] for e in events})
 
 
 @router.get("/meta/recent")

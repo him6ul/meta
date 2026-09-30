@@ -34,6 +34,36 @@ class Settings(BaseSettings):
     audit_journal_token: str = ""
     audit_journal_timeout_seconds: float = 2.0
 
+    # AWS Secrets Manager (optional). Fields in the secret override env; refreshed for rotation.
+    secrets_manager_secret_id: str = ""
+    secrets_manager_region: str = "us-east-1"
+    secrets_manager_endpoint_url: str = ""
+    secrets_refresh_seconds: float = 300
+
+    # Proactive rate limiting (see app/rate_limiter.py)
+    meta_rate_limiting_enabled: bool = True
+    meta_rate_soft_pct: float = 80
+    meta_rate_hard_pct: float = 95
+    meta_rate_max_delay_seconds: float = 2.0
+    meta_rate_max_wait_seconds: float = 2.0
+    meta_usage_stale_seconds: float = 120
+    wa_messages_per_second: float = 80
+    wa_pair_rate_per_second: float = 1 / 6   # 0 disables the per-recipient limit
+    wa_pair_burst: float = 10
+
+    # Token health: /debug_token every N seconds (0 = off); alert if these scopes are missing.
+    meta_token_check_interval_seconds: float = 3600
+    meta_required_scopes: str = ""
+
+    # Webhooks: reject unsigned deliveries (503, so Meta retries once the secret is configured).
+    meta_webhook_require_signature: bool = True
+    meta_webhook_dedup_path: str = "data/webhook_dedup.sqlite"
+    meta_webhook_dedup_ttl_days: float = 7
+
+    # WhatsApp delivery tracking
+    whatsapp_delivery_db_path: str = "data/deliveries.sqlite"
+    whatsapp_stale_after_seconds: float = 600
+
     log_level: str = "INFO"
     otel_exporter_otlp_endpoint: str = ""
     otel_service_name: str = "meta-api-tester"

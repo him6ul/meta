@@ -16,15 +16,18 @@ os.environ.update({
     "META_MAX_RETRIES": "2",
     "META_CIRCUIT_FAILURE_THRESHOLD": "3",
     "OTEL_EXPORTER_OTLP_ENDPOINT": "",
+    "META_TOKEN_CHECK_INTERVAL_SECONDS": "0",
     "AUDIT_LOG_PATH": os.path.join(tempfile.mkdtemp(), "audit.jsonl"),
 })
 
 
 @pytest.fixture(autouse=True)
-def fresh_audit_log(tmp_path, monkeypatch):
+def fresh_audit_log(tmp_path, monkeypatch, request):
     """Each test gets its own audit file so chain assertions are independent."""
     from app.config import get_settings
     monkeypatch.setenv("AUDIT_LOG_PATH", str(tmp_path / "audit.jsonl"))
+    monkeypatch.setenv("META_WEBHOOK_DEDUP_PATH", str(tmp_path / "dedup.sqlite"))
+    monkeypatch.setenv("WHATSAPP_DELIVERY_DB_PATH", str(tmp_path / "deliveries.sqlite"))
     get_settings.cache_clear()
     yield tmp_path / "audit.jsonl"
     get_settings.cache_clear()

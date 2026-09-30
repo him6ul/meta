@@ -42,6 +42,10 @@ META_REGAIN_ACCESS = Gauge(
     "estimated_time_to_regain_access from X-Business-Use-Case-Usage",
     ["scope_id", "usage_type"],
 )
+META_LOCAL_RATE_LIMITED = Counter("meta_api_local_rate_limited_total",
+                                  "Calls refused locally (never sent) to stay under Meta limits", ["reason"])
+META_RATE_LIMIT_WAIT = Histogram("meta_api_rate_limit_wait_seconds", "Delay added by proactive pacing",
+                                 ["reason"], buckets=(0.01, 0.05, 0.1, 0.25, 0.5, 1, 2, 5))
 META_CIRCUIT_STATE = Gauge(
     "meta_api_circuit_state",
     "Circuit breaker state: 0=closed, 1=half-open, 2=open",
@@ -62,6 +66,31 @@ WEBHOOK_VERIFICATIONS = Counter(
     "Webhook subscription verification handshakes",
     ["result"],
 )
+
+WEBHOOK_DUPLICATES = Counter("meta_webhook_events_deduplicated_total",
+                             "Webhook events dropped as redeliveries of already-processed events",
+                             ["object", "kind"])
+WEBHOOK_REJECTED = Counter("meta_webhook_rejected_total", "Webhook deliveries rejected", ["reason"])
+
+# --- WhatsApp delivery (status webhooks correlated with sends) ---
+WA_MESSAGES_SENT = Counter("whatsapp_messages_sent_total", "WhatsApp messages accepted by the Cloud API", ["kind"])
+WA_STATUS_EVENTS = Counter("whatsapp_status_events_total", "First-time status webhooks by status", ["status"])
+WA_DELIVERY_LATENCY = Histogram("whatsapp_status_latency_seconds",
+                                "Time from API accept to each status (sent / delivered / read)", ["status"],
+                                buckets=(0.5, 1, 2, 5, 10, 30, 60, 300, 900, 3600, 21600, 86400))
+WA_FAILURES = Counter("whatsapp_message_failures_total", "Failed deliveries by Meta error", ["code", "title"])
+WA_MESSAGES_STALE = Gauge("whatsapp_messages_stale_undelivered",
+                          "Messages accepted/sent but not delivered within the stale threshold")
+
+# --- Access token health (from /debug_token) ---
+META_TOKEN_VALID = Gauge("meta_token_valid", "1 if Meta reports the access token as valid")
+META_TOKEN_EXPIRES = Gauge("meta_token_expires_timestamp_seconds", "Token expiry (unix time, 0 = never)")
+META_TOKEN_DATA_ACCESS_EXPIRES = Gauge("meta_token_data_access_expires_timestamp_seconds",
+                                       "Data-access expiry (unix time, 0 = never)")
+META_TOKEN_MISSING_SCOPES = Gauge("meta_token_missing_required_scopes", "Required scopes the token lacks")
+META_TOKEN_CHECK_LAST_SUCCESS = Gauge("meta_token_check_last_success_timestamp_seconds",
+                                      "Last successful /debug_token check")
+META_TOKEN_CHECK_FAILURES = Counter("meta_token_check_failures_total", "Failed /debug_token checks")
 
 # --- Audit trail ---
 AUDIT_EVENTS = Counter("audit_events_total", "Audit records written", ["action", "outcome"])
@@ -110,3 +139,15 @@ for _kind in ("http_request", "meta_api", "circuit"):
     AUDIT_OUTCOME_UNRECORDED.labels(_kind)
 for _reason in ("unreachable", "503", "400", "401", "409"):
     AUDIT_JOURNAL_FAILURES.labels(_reason)
+for _reason in ("signature_missing_secret", "signature_invalid", "invalid_json"):
+    WEBHOOK_REJECTED.labels(_reason)
+for _status in ("sent", "delivered", "read", "failed"):
+    WA_STATUS_EVENTS.labels(_status)
+for _kind in ("text", "template"):
+    WA_MESSAGES_SENT.labels(_kind)
+for _reason in ("regain_access", "usage_hard", "wa_throughput", "wa_pair"):
+    META_LOCAL_RATE_LIMITED.labels(_reason)
+
+# Unknown until the first successful /debug_token check (NaN never matches `== 0`), so a fresh process
+# (or another service that imports this module) can't raise a false "token invalid" alert.
+META_TOKEN_VALID.set(float("nan"))

@@ -1,4 +1,4 @@
-.PHONY: install test run mock up down load chaos-errors chaos-outage chaos-throttle chaos-reset webhook audit audit-verify slack audit-verify-s3 audit-archive-ls audit-archive-reset-local
+.PHONY: contract token-status delivery-stats verify-last install test run mock up down load chaos-errors chaos-outage chaos-throttle chaos-reset webhook audit audit-verify slack audit-verify-s3 audit-archive-ls audit-archive-reset-local
 
 install:
 	python3 -m venv .venv && .venv/bin/pip install -r requirements-dev.txt
@@ -54,3 +54,15 @@ audit-archive-ls:
 
 audit-archive-reset-local:   ## LocalStack only: wipe the ephemeral archive and the shipper checkpoint
 	docker compose rm -sf localstack audit-shipper && docker volume rm -f meta_shipper-state && docker compose up -d
+
+contract:   ## live contract tests against the real Meta API (needs META_LIVE_* env; see tests/contract)
+	.venv/bin/pytest -m live tests/contract -v
+
+token-status:
+	curl -s 'localhost:8000/api/token-status?refresh=true' | python3 -m json.tool
+
+delivery-stats:
+	curl -s localhost:8000/api/whatsapp/delivery-stats | python3 -m json.tool
+
+verify-last:   ## latest scheduled archive verification (runs in the sidecar every AUDIT_VERIFY_INTERVAL_SECONDS)
+	docker compose exec -T audit-shipper python -c "import urllib.request as u;print(u.urlopen('http://localhost:9102/verify/last').read().decode())" | python3 -m json.tool

@@ -16,6 +16,11 @@ from app.config import get_settings
 from app.graph_client import CircuitBreaker, CircuitOpenError, MetaAPIError, MetaGraphClient
 from app.metrics import AUDIT_OUTCOME_UNRECORDED, AUDIT_REFUSED, HTTP_LATENCY, HTTP_REQUESTS
 from app.observability import setup_logging, setup_tracing
+from app.rate_limiter import LocalRateLimited
+from app.secrets import APP_SECRET_FIELDS, SecretsError, SecretsLoader
+from app.delivery_tracker import DeliveryTracker
+from app.token_monitor import TokenMonitor
+from app.webhook_dedup import WebhookDedup
 
 log = logging.getLogger("app")
 
@@ -40,17 +45,53 @@ AUDIT_UNAVAILABLE_BODY = {"error": "audit trail unavailable: action refused (fai
 
 
 def create_app(transport: httpx.AsyncBaseTransport | None = None,
-               journal_transport: httpx.AsyncBaseTransport | None = None) -> FastAPI:
+               journal_transport: httpx.AsyncBaseTransport | None = None,
+               secrets_client=None) -> FastAPI:
     settings = get_settings()
     setup_logging(settings)
+    secrets = None
+    if settings.secrets_manager_secret_id:
+        # Loaded before anything else is built, so every component starts with the real values.
+        secrets = SecretsLoader(settings, settings.secrets_manager_secret_id, APP_SECRET_FIELDS,
+                                region=settings.secrets_manager_region,
+                                endpoint_url=settings.secrets_manager_endpoint_url, client=secrets_client)
+        secrets.load()
     journal = (JournalClient(settings.audit_journal_url, settings.audit_journal_token,
                              timeout=settings.audit_journal_timeout_seconds, transport=journal_transport)
                if settings.audit_journal_url else None)
     audit = AuditLog(settings.audit_log_path, journal=journal)
+    rotations: list[dict[str, str]] = []
+
+    def on_secret_change(changed: dict[str, str]) -> None:
+        if journal and "audit_journal_token" in changed:
+            journal.set_token(settings.audit_journal_token)
+        rotations.append(changed)
+
+    async def refresh_secrets_loop() -> None:
+        while True:
+            await asyncio.sleep(settings.secrets_refresh_seconds)
+            try:
+                await asyncio.to_thread(secrets.load)
+            except SecretsError as exc:
+                log.error("secrets refresh failed; keeping current values", extra={"error": str(exc)})
+            while rotations:
+                changed = rotations.pop(0)
+                try:
+                    await audit.arecord("secrets.rotated", actor="system", resource=settings.secrets_manager_secret_id,
+                                        fields=sorted(changed), fingerprints=changed, version_id=secrets.version_id)
+                except AuditUnavailable:
+                    log.error("secret rotation not durably audited")
+
+    if secrets:
+        secrets.on_change = on_secret_change
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
         app.state.meta = MetaGraphClient(settings, transport=transport, audit=audit)
+        app.state.webhook_dedup = WebhookDedup(settings.meta_webhook_dedup_path, settings.meta_webhook_dedup_ttl_days)
+        app.state.token_monitor = TokenMonitor(settings, app.state.meta)
+        app.state.delivery_tracker = DeliveryTracker(settings.whatsapp_delivery_db_path, audit=audit,
+                                                     stale_after_seconds=settings.whatsapp_stale_after_seconds)
         # Refuse to start serving until the journal accepts records (the gateway may still be booting).
         for attempt in range(30):
             try:
@@ -66,7 +107,18 @@ def create_app(transport: httpx.AsyncBaseTransport | None = None,
                 log.warning("audit journal not ready; retrying startup")
                 await asyncio.sleep(1)
         log.info("started", extra={"graph_url": settings.graph_url, "audit_journal": bool(journal)})
+        app.state.token_monitor.start()
+        app.state.delivery_tracker.start()
+        refresher = asyncio.create_task(refresh_secrets_loop()) if secrets and settings.secrets_refresh_seconds > 0 else None
+        if secrets:
+            await audit.arecord("secrets.loaded", actor="system", resource=settings.secrets_manager_secret_id,
+                                version_id=secrets.version_id)
         yield
+        if refresher:
+            refresher.cancel()
+        await app.state.token_monitor.stop()
+        await app.state.delivery_tracker.stop()
+        app.state.webhook_dedup.close()
         try:
             await audit.arecord("app.stopped", actor="system", resource="meta-api-tester")
         except AuditUnavailable:
@@ -149,6 +201,11 @@ def create_app(transport: httpx.AsyncBaseTransport | None = None,
     async def audit_unavailable(_: Request, exc: AuditUnavailable):
         return JSONResponse(status_code=503, content=AUDIT_UNAVAILABLE_BODY)
 
+    @app.exception_handler(LocalRateLimited)
+    async def local_rate_limited(_: Request, exc: LocalRateLimited):
+        return JSONResponse(status_code=429, headers={"retry-after": str(int(exc.retry_after + 0.999))},
+                            content={"error": str(exc), "reason": exc.reason, "source": "local"})
+
     @app.exception_handler(CircuitOpenError)
     async def circuit_open(_: Request, exc: CircuitOpenError):
         return JSONResponse(status_code=503, content={"error": str(exc)})
@@ -171,6 +228,8 @@ def create_app(transport: httpx.AsyncBaseTransport | None = None,
         }
         if journal:
             checks["audit_journal_reachable"] = await journal.healthy()
+        if settings.meta_webhook_require_signature:
+            checks["webhook_signature_configured"] = bool(settings.meta_app_secret)
         ok = all(checks.values())
         return JSONResponse(status_code=200 if ok else 503, content={"ready": ok, "checks": checks})
 

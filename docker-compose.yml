@@ -1,3 +1,5 @@
+name: meta   # pinned: the log collector (alloy) filters on this project name
+
 # Default: app talks to the bundled mock Meta server. For the real API, set
 # META_GRAPH_BASE_URL=https://graph.facebook.com (and real credentials) in .env.
 x-common-env: &meta-env
@@ -23,6 +25,16 @@ services:
       # Set AUDIT_JOURNAL_URL= (empty) to fall back to batched shipping only.
       AUDIT_JOURNAL_URL: ${AUDIT_JOURNAL_URL-http://audit-shipper:9102}
       AUDIT_JOURNAL_TOKEN: ${AUDIT_JOURNAL_TOKEN:-local-dev-journal-token}
+      META_WEBHOOK_DEDUP_PATH: /data/webhook_dedup.sqlite
+      WHATSAPP_DELIVERY_DB_PATH: /data/deliveries.sqlite
+      META_TOKEN_CHECK_INTERVAL_SECONDS: ${META_TOKEN_CHECK_INTERVAL_SECONDS:-300}
+      META_REQUIRED_SCOPES: ${META_REQUIRED_SCOPES:-whatsapp_business_messaging}
+      # Optional: load secrets from Secrets Manager (LocalStack has meta-api-tester/app pre-created).
+      SECRETS_MANAGER_SECRET_ID: ${APP_SECRETS_MANAGER_SECRET_ID:-}
+      SECRETS_MANAGER_ENDPOINT_URL: ${SECRETS_MANAGER_ENDPOINT_URL-http://localstack:4566}
+      SECRETS_REFRESH_SECONDS: ${SECRETS_REFRESH_SECONDS:-60}
+      AWS_ACCESS_KEY_ID: ${APP_AWS_ACCESS_KEY_ID:-test}
+      AWS_SECRET_ACCESS_KEY: ${APP_AWS_SECRET_ACCESS_KEY:-test}
     volumes:
       - audit-data:/data
     restart: unless-stopped
@@ -56,8 +68,9 @@ services:
     image: localstack/localstack:4.14
     ports: ["4566:4566"]
     environment:
-      SERVICES: s3
+      SERVICES: s3,secretsmanager
       AUDIT_S3_BUCKET: ${AUDIT_S3_BUCKET:-meta-audit-local}
+      JOURNAL_TOKEN: ${AUDIT_JOURNAL_TOKEN:-local-dev-journal-token}
     volumes:
       - ./monitoring/localstack/init-audit-bucket.sh:/etc/localstack/init/ready.d/init-audit-bucket.sh:ro
     healthcheck:
@@ -86,6 +99,10 @@ services:
       AWS_ACCESS_KEY_ID: ${AUDIT_AWS_ACCESS_KEY_ID:-test}
       AWS_SECRET_ACCESS_KEY: ${AUDIT_AWS_SECRET_ACCESS_KEY:-test}
       AUDIT_JOURNAL_TOKEN: ${AUDIT_JOURNAL_TOKEN:-local-dev-journal-token}
+      AUDIT_VERIFY_INTERVAL_SECONDS: ${AUDIT_VERIFY_INTERVAL_SECONDS:-300}
+      SECRETS_MANAGER_SECRET_ID: ${GATEWAY_SECRETS_MANAGER_SECRET_ID:-}
+      SECRETS_MANAGER_ENDPOINT_URL: ${SECRETS_MANAGER_ENDPOINT_URL-http://localstack:4566}
+      SECRETS_REFRESH_SECONDS: ${SECRETS_REFRESH_SECONDS:-60}
     volumes:
       - audit-data:/data:ro
       - shipper-state:/state
@@ -133,7 +150,24 @@ services:
     volumes:
       - ./monitoring/grafana/provisioning:/etc/grafana/provisioning:ro
       - ./monitoring/grafana/dashboards:/var/lib/grafana/dashboards:ro
-    depends_on: [prometheus]
+    depends_on: [prometheus, loki]
+
+  loki:
+    image: grafana/loki:3.5.3
+    ports: ["3100:3100"]
+    command: ["-config.file=/etc/loki/loki.yml"]
+    volumes:
+      - ./monitoring/loki/loki.yml:/etc/loki/loki.yml:ro
+      - loki-data:/loki
+
+  # Ships container logs to Loki. Needs the Docker socket (read-only) for discovery: local use only.
+  alloy:
+    image: grafana/alloy:v1.10.2
+    command: ["run", "/etc/alloy/config.alloy", "--storage.path=/var/lib/alloy/data"]
+    volumes:
+      - ./monitoring/alloy/config.alloy:/etc/alloy/config.alloy:ro
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    depends_on: [loki]
 
   jaeger:
     image: jaegertracing/all-in-one:1.72.0
@@ -144,3 +178,4 @@ services:
 volumes:
   audit-data:
   shipper-state:
+  loki-data:

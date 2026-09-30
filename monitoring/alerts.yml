@@ -116,3 +116,108 @@ groups:
         labels: {severity: warning}
         annotations:
           summary: "Synchronous audit journal p95 {{ $value | humanizeDuration }} - every request pays this latency"
+
+      - alert: AuditArchiveVerifyFailed
+        expr: audit_archive_verify_ok == 0
+        labels: {severity: critical}
+        annotations:
+          summary: "Scheduled audit archive verification FAILED - check audit-shipper /verify/last"
+
+      - alert: AuditArchiveVerifyStale
+        expr: time() - audit_archive_verify_last_run_timestamp_seconds > 2700
+        labels: {severity: warning}
+        annotations:
+          summary: "Audit archive not verified for {{ $value | humanizeDuration }}"
+
+      - alert: AuditOpenIntents
+        expr: audit_archive_open_intents > 0
+        for: 10m
+        labels: {severity: warning}
+        annotations:
+          summary: "{{ $value }} durable intents have no recorded outcome (action result unknown)"
+
+  - name: meta-token
+    rules:
+      - alert: MetaTokenInvalid
+        expr: meta_token_valid{job="meta-api-tester"} == 0
+        labels: {severity: critical}
+        annotations:
+          summary: "Meta reports the access token as INVALID - see /api/token-status"
+
+      - alert: MetaTokenExpiringSoon
+        expr: (meta_token_expires_timestamp_seconds - time()) < 7 * 86400 and meta_token_expires_timestamp_seconds > 0
+        labels: {severity: warning}
+        annotations:
+          summary: "Meta access token expires in {{ $value | humanizeDuration }}"
+
+      - alert: MetaTokenExpiresWithinADay
+        expr: (meta_token_expires_timestamp_seconds - time()) < 86400 and meta_token_expires_timestamp_seconds > 0
+        labels: {severity: critical}
+        annotations:
+          summary: "Meta access token expires in {{ $value | humanizeDuration }} - rotate now"
+
+      - alert: MetaTokenDataAccessExpiringSoon
+        expr: (meta_token_data_access_expires_timestamp_seconds - time()) < 7 * 86400 and meta_token_data_access_expires_timestamp_seconds > 0
+        labels: {severity: warning}
+        annotations:
+          summary: "Meta data-access expires in {{ $value | humanizeDuration }} (user must re-authorise)"
+
+      - alert: MetaTokenMissingScopes
+        expr: meta_token_missing_required_scopes > 0
+        labels: {severity: warning}
+        annotations:
+          summary: "Access token lacks {{ $value }} required permission(s) - see /api/token-status"
+
+      - alert: MetaTokenCheckStale
+        expr: (time() - meta_token_check_last_success_timestamp_seconds) > 3 * 3600 and meta_token_check_last_success_timestamp_seconds > 0
+        labels: {severity: warning}
+        annotations:
+          summary: "Token health not confirmed for {{ $value | humanizeDuration }}"
+
+  - name: meta-webhooks-and-delivery
+    rules:
+      - alert: MetaWebhookSignatureNotConfigured
+        expr: sum(increase(meta_webhook_rejected_total{reason="signature_missing_secret"}[5m])) > 0
+        labels: {severity: critical}
+        annotations:
+          summary: "Webhooks rejected: META_APP_SECRET is not configured (Meta is retrying deliveries)"
+
+      - alert: MetaWebhookRedeliveriesHigh
+        expr: |
+          sum(rate(meta_webhook_events_deduplicated_total[15m]))
+            / clamp_min(sum(rate(meta_webhook_events_total[15m])), 1e-9) > 0.2
+        for: 15m
+        labels: {severity: warning}
+        annotations:
+          summary: "{{ $value | humanizePercentage }} of webhook events are redeliveries - are we acking slowly or failing?"
+
+      - alert: WhatsAppDeliveryFailureRateHigh
+        expr: |
+          sum(rate(whatsapp_status_events_total{status="failed"}[15m]))
+            / clamp_min(sum(rate(whatsapp_messages_sent_total[15m])), 1e-9) > 0.05
+        for: 10m
+        labels: {severity: warning}
+        annotations:
+          summary: "WhatsApp delivery failure rate {{ $value | humanizePercentage }} - see /api/whatsapp/delivery-stats"
+
+      - alert: WhatsAppMessagesStuck
+        expr: whatsapp_messages_stale_undelivered > 0
+        for: 10m
+        labels: {severity: warning}
+        annotations:
+          summary: "{{ $value }} WhatsApp messages accepted but not delivered after 10 minutes"
+
+      - alert: MetaLocalRateLimiting
+        expr: sum(increase(meta_api_local_rate_limited_total[5m])) > 0
+        for: 5m
+        labels: {severity: warning}
+        annotations:
+          summary: "Calls are being refused locally to stay under Meta limits ({{ $value }} in 5m)"
+
+  - name: secrets
+    rules:
+      - alert: SecretsRefreshFailing
+        expr: sum(increase(secrets_refresh_failures_total[15m])) > 0
+        labels: {severity: warning}
+        annotations:
+          summary: "Secrets Manager refresh failing - running on cached secrets, rotations will not apply"

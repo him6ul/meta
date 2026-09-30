@@ -32,6 +32,17 @@ class MockConfig(BaseModel):
     latency_ms: int = int(os.getenv("MOCK_LATENCY_MS", "80"))
     latency_jitter_ms: int = int(os.getenv("MOCK_LATENCY_JITTER_MS", "120"))
     outage: bool = False                                                 # every call -> 503
+    # /debug_token behaviour (to exercise token-expiry alerts)
+    token_valid: bool = True
+    token_expires_in_days: float | None = None        # None = never expires
+    data_access_expires_in_days: float | None = 90
+    token_scopes: list[str] = ["whatsapp_business_messaging", "whatsapp_business_management",
+                               "pages_read_engagement", "pages_manage_posts", "instagram_basic"]
+    # WhatsApp status webhooks after each accepted message (to exercise delivery tracking + dedup)
+    status_webhooks: bool = os.getenv("MOCK_STATUS_WEBHOOKS", "true").lower() == "true"
+    delivery_fail_rate: float = float(os.getenv("MOCK_DELIVERY_FAIL_RATE", "0.03"))
+    read_rate: float = 0.7
+    redelivery_rate: float = float(os.getenv("MOCK_REDELIVERY_RATE", "0.1"))   # resend same webhook
 
 
 CONFIG = MockConfig()
@@ -142,7 +153,7 @@ async def fake_slack_messages():
 
 
 @app.post("/_mock/send-webhook")
-async def send_webhook(request: Request, valid_signature: bool = True):
+async def send_webhook(request: Request, valid_signature: bool = True, duplicate: bool = False):
     payload = {"object": "whatsapp_business_account", "entry": [{
         "id": "123456789", "changes": [{"field": "messages", "value": {
             "messaging_product": "whatsapp",
@@ -155,12 +166,15 @@ async def send_webhook(request: Request, valid_signature: bool = True):
     body = json.dumps(payload).encode()
     secret = APP_SECRET if valid_signature else "wrong-secret"
     sig = "sha256=" + hmac.new(secret.encode(), body, hashlib.sha256).hexdigest()
+    responses = []
     async with httpx.AsyncClient(timeout=5) as c:
-        r = await c.post(WEBHOOK_TARGET, content=body,
-                         headers={"content-type": "application/json", "x-hub-signature-256": sig})
+        for _ in range(2 if duplicate else 1):
+            r = await c.post(WEBHOOK_TARGET, content=body,
+                             headers={"content-type": "application/json", "x-hub-signature-256": sig})
+            responses.append({"status": r.status_code, "response": r.text})
     audit("mock.webhook.sent", request, target=WEBHOOK_TARGET, valid_signature=valid_signature,
-          response_status=r.status_code)
-    return {"target": WEBHOOK_TARGET, "status": r.status_code, "response": r.text}
+          duplicate=duplicate, response_status=[x["status"] for x in responses])
+    return {"target": WEBHOOK_TARGET, "status": responses[-1]["status"], "deliveries": responses}
 
 
 # ---------- Graph API surface ----------
@@ -172,10 +186,16 @@ async def me(fields: str = "id,name"):
 
 @app.get("/{version}/debug_token")
 async def debug_token(input_token: str):
-    return {"data": {"app_id": "999", "type": "SYSTEM_USER", "application": "Mock App",
-                     "is_valid": True, "expires_at": 0, "data_access_expires_at": 0,
-                     "scopes": ["whatsapp_business_messaging", "pages_read_engagement",
-                                "pages_manage_posts", "instagram_basic"]}}
+    now = time.time()
+    exp = CONFIG.token_expires_in_days
+    dexp = CONFIG.data_access_expires_in_days
+    data = {"app_id": "999", "type": "SYSTEM_USER", "application": "Mock App", "is_valid": CONFIG.token_valid,
+            "expires_at": int(now + exp * 86400) if exp is not None else 0,
+            "data_access_expires_at": int(now + dexp * 86400) if dexp is not None else 0,
+            "scopes": CONFIG.token_scopes}
+    if not CONFIG.token_valid:
+        data["error"] = {"code": 190, "message": "Error validating access token: Session has expired."}
+    return {"data": data}
 
 
 @app.post("/{version}/{phone_id}/messages")
@@ -183,8 +203,50 @@ async def wa_messages(phone_id: str, request: Request):
     body = await request.json()
     if body.get("messaging_product") != "whatsapp" or not body.get("to"):
         return _error(400, 100, "(#100) Invalid parameter")
+    wamid = f"wamid.{uuid.uuid4().hex}"
+    if CONFIG.status_webhooks:
+        asyncio.create_task(_status_lifecycle(wamid, body["to"]))
     return {"messaging_product": "whatsapp", "contacts": [{"input": body["to"], "wa_id": body["to"]}],
-            "messages": [{"id": f"wamid.{uuid.uuid4().hex}"}]}
+            "messages": [{"id": wamid}]}
+
+
+async def _post_signed(payload: dict, redeliver: bool = False) -> None:
+    body = json.dumps(payload).encode()
+    sig = "sha256=" + hmac.new(APP_SECRET.encode(), body, hashlib.sha256).hexdigest()
+    headers = {"content-type": "application/json", "x-hub-signature-256": sig}
+    async with httpx.AsyncClient(timeout=5) as c:
+        for attempt in range(2 if redeliver else 1):
+            try:
+                await c.post(WEBHOOK_TARGET, content=body, headers=headers)
+            except httpx.HTTPError:
+                pass
+            if redeliver:
+                await asyncio.sleep(random.uniform(0.2, 1.0))
+
+
+def _status_payload(wamid: str, to: str, status: str, error: dict | None = None) -> dict:
+    st = {"id": wamid, "status": status, "timestamp": str(int(time.time())), "recipient_id": to}
+    if error:
+        st["errors"] = [error]
+    return {"object": "whatsapp_business_account", "entry": [{"id": "123456789", "changes": [{
+        "field": "messages", "value": {"messaging_product": "whatsapp",
+                                       "metadata": {"phone_number_id": "1098765"}, "statuses": [st]}}]}]}
+
+
+async def _status_lifecycle(wamid: str, to: str) -> None:
+    """sent -> delivered -> (read) or sent -> failed, like the Cloud API; sometimes redelivered."""
+    await asyncio.sleep(random.uniform(0.3, 1.0))
+    await _post_signed(_status_payload(wamid, to, "sent"), random.random() < CONFIG.redelivery_rate)
+    await asyncio.sleep(random.uniform(0.5, 3.0))
+    if random.random() < CONFIG.delivery_fail_rate:
+        await _post_signed(_status_payload(wamid, to, "failed", {
+            "code": 131026, "title": "Message undeliverable",
+            "error_data": {"details": "Receiver is incapable of receiving this message"}}))
+        return
+    await _post_signed(_status_payload(wamid, to, "delivered"), random.random() < CONFIG.redelivery_rate)
+    if random.random() < CONFIG.read_rate:
+        await asyncio.sleep(random.uniform(1.0, 8.0))
+        await _post_signed(_status_payload(wamid, to, "read"), random.random() < CONFIG.redelivery_rate)
 
 
 @app.get("/{version}/{page_id}/posts")

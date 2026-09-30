@@ -1,4 +1,6 @@
 """Test-harness endpoints that exercise common Meta Graph API products."""
+import hashlib
+import time
 from typing import Any
 
 from fastapi import APIRouter, HTTPException, Request
@@ -35,11 +37,25 @@ async def debug_token(request: Request):
                                      token=app_token)
 
 
+@router.get("/token-status")
+async def token_status(request: Request, refresh: bool = False):
+    """Result of the periodic /debug_token check (expiry, validity, missing scopes)."""
+    monitor = request.app.state.token_monitor
+    return await monitor.check() if refresh or not monitor.last.get("checked") else monitor.last
+
+
 @router.get("/rate-limits")
 async def rate_limits(request: Request):
     """Last rate-limit usage headers seen from Meta, plus circuit breaker state."""
     c = client(request)
-    return {"usage": c.last_usage, "circuit_state": c.breaker.state, "consecutive_failures": c.breaker.failures}
+    limiter = c.limiter
+    return {"usage": c.last_usage, "circuit_state": c.breaker.state, "consecutive_failures": c.breaker.failures,
+            "pacing": None if limiter is None else {
+                "max_usage_pct": limiter.current_usage("*"),
+                "regain_access_in_s": {str(k or "app"): round(v - time.time(), 1)
+                                       for k, v in limiter.regain_until.items() if v > time.time()},
+                "tracked_phone_numbers": len(limiter.phone_buckets),
+                "tracked_recipient_pairs": len(limiter.pair_buckets)}}
 
 
 @router.get("/graph/{path:path}")
@@ -62,13 +78,22 @@ class WhatsAppTemplate(BaseModel):
     components: list[dict[str, Any]] = []
 
 
+def track_sent(request: Request, result: dict, kind: str, to: str) -> dict:
+    for m in result.get("messages", []):
+        if m.get("id"):
+            request.app.state.delivery_tracker.on_sent(
+                m["id"], kind, recipient_hash=hashlib.sha256(to.encode()).hexdigest()[:16])
+    return result
+
+
 @router.post("/whatsapp/messages", tags=["whatsapp"])
 async def whatsapp_send_text(request: Request, body: WhatsAppText):
     phone_id = require(get_settings().whatsapp_phone_number_id, "WHATSAPP_PHONE_NUMBER_ID")
-    return await client(request).post(f"/{phone_id}/messages", json_body={
+    result = await client(request).post(f"/{phone_id}/messages", json_body={
         "messaging_product": "whatsapp", "recipient_type": "individual", "to": body.to,
         "type": "text", "text": {"preview_url": False, "body": body.text},
     })
+    return track_sent(request, result, "text", body.to)
 
 
 @router.post("/whatsapp/templates", tags=["whatsapp"])
@@ -77,9 +102,23 @@ async def whatsapp_send_template(request: Request, body: WhatsAppTemplate):
     template: dict[str, Any] = {"name": body.template, "language": {"code": body.language}}
     if body.components:
         template["components"] = body.components
-    return await client(request).post(f"/{phone_id}/messages", json_body={
+    result = await client(request).post(f"/{phone_id}/messages", json_body={
         "messaging_product": "whatsapp", "to": body.to, "type": "template", "template": template,
     })
+    return track_sent(request, result, "template", body.to)
+
+
+@router.get("/whatsapp/messages/{wamid}/status", tags=["whatsapp"])
+async def whatsapp_message_status(request: Request, wamid: str):
+    row = request.app.state.delivery_tracker.get(wamid)
+    if row is None:
+        raise HTTPException(status_code=404, detail="unknown message id")
+    return row
+
+
+@router.get("/whatsapp/delivery-stats", tags=["whatsapp"])
+async def whatsapp_delivery_stats(request: Request, window_seconds: float = 3600):
+    return request.app.state.delivery_tracker.stats(window_seconds)
 
 
 # ---------- Facebook Pages ----------

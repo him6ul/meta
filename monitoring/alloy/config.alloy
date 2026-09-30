@@ -1,0 +1,58 @@
+// Collect stdout/stderr of this compose project's containers and ship them to Loki.
+// JSON logs are parsed: `level`/`logger` become labels, `trace_id` becomes structured metadata, so a log
+// line links to its Jaeger trace (and a trace links back to its logs) without exploding label cardinality.
+
+discovery.docker "containers" {
+  host = "unix:///var/run/docker.sock"
+  filter {
+    name   = "label"
+    values = ["com.docker.compose.project=meta"]
+  }
+}
+
+discovery.relabel "containers" {
+  targets = discovery.docker.containers.targets
+  rule {
+    source_labels = ["__meta_docker_container_label_com_docker_compose_service"]
+    target_label  = "service"
+  }
+}
+
+loki.source.docker "containers" {
+  host          = "unix:///var/run/docker.sock"
+  targets       = discovery.docker.containers.targets
+  relabel_rules = discovery.relabel.containers.rules
+  forward_to    = [loki.process.json.receiver]
+}
+
+loki.process "json" {
+  stage.json {
+    expressions = {level = "level", logger = "logger", trace_id = "trace_id", audit = "audit", action = "action"}
+  }
+  stage.labels {
+    values = {level = "", logger = ""}
+  }
+  stage.structured_metadata {
+    values = {trace_id = "", action = ""}
+  }
+  // Mark audit lines (app `audit` logger and sidecar audit events) so they are one click away.
+  stage.match {
+    selector = "{logger=\"audit\"}"
+    stage.static_labels {
+      values = {stream = "audit"}
+    }
+  }
+  stage.match {
+    selector = "{service=~\"audit-shipper|mock-meta\"} |= \"\\\"audit\\\": true\""
+    stage.static_labels {
+      values = {stream = "audit"}
+    }
+  }
+  forward_to = [loki.write.local.receiver]
+}
+
+loki.write "local" {
+  endpoint {
+    url = "http://loki:3100/loki/api/v1/push"
+  }
+}
